@@ -18,6 +18,7 @@ const { ZOHO_CLIENT_ID, ZOHO_CLIENT_SECRET, ZOHO_REFRESH_TOKEN } = process.env;
 const MODULE_SURGEONS = "Surgeons";
 const FIELD_ACTIVE = "Active_Status";
 const FIELD_COUNTRY = "Country";
+const FIELD_STATE = "State";
 const FIELD_CITY = "City";
 const FIELD_NAME = "Name";
 const FIELD_PRICE = "Surgery_Price";
