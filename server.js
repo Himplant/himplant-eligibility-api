@@ -1,57 +1,32 @@
+/**
+ * server.js — READY TO COPY/PASTE
+ *
+ * Goal: Make the questionnaire work NOW.
+ * ✅ CORS: allow ALL origins (temporary) so Lovable/Webflow/Render previews will work immediately.
+ * ✅ HIPAA note: This is for TESTING ONLY. Tomorrow, lock down CORS to your real domains.
+ *
+ * Uses node-fetch (already in your repo), NOT axios.
+ */
+
 import express from "express";
 import cors from "cors";
 import fetch from "node-fetch";
 
 const app = express();
 
-app.use(express.json({ limit: "1mb" }));
+// Parse JSON bodies
+app.use(express.json({ limit: "2mb" }));
 
 /**
- * ✅ Production domains (keep these forever)
+ * ✅ CORS (OPEN FOR TESTING)
+ * This is what will immediately stop the "Not allowed by CORS" errors.
+ *
+ * IMPORTANT: Tomorrow, when you have custom domains, change this to a strict allowlist.
  */
-const STRICT_ALLOWED_ORIGINS = [
-  "https://himplant.com",
-  "https://www.himplant.com",
-  "https://eligibility.himplant.com",
-];
-
-/**
- * ✅ Emergency testing override:
- * In Render env vars, set:
- *   CORS_ALLOW_ALL=true
- * ONLY for debugging. Turn off after.
- */
-const CORS_ALLOW_ALL = String(process.env.CORS_ALLOW_ALL || "").toLowerCase() === "true";
-
-/**
- * ✅ Testing wildcard origins (today)
- * Lovable preview is: *.lovable.app
- */
-function isAllowedTestingOrigin(origin) {
-  return (
-    origin.endsWith(".onrender.com") ||
-    origin.endsWith(".webflow.io") ||
-    origin.endsWith(".lovable.app")
-  );
-}
-
 app.use(
   cors({
-    origin: (origin, callback) => {
-      // server-to-server / curl
-      if (!origin) return callback(null, true);
-
-      // emergency mode
-      if (CORS_ALLOW_ALL) return callback(null, true);
-
-      // strict allowlist
-      if (STRICT_ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
-
-      // testing allowlist
-      if (isAllowedTestingOrigin(origin)) return callback(null, true);
-
-      return callback(new Error(`Not allowed by CORS: ${origin}`));
-    },
+    origin: true, // reflect request origin
+    credentials: false,
     methods: ["GET", "POST", "PUT", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
   })
@@ -64,7 +39,7 @@ const ZOHO_BASE = "https://www.zohoapis.com";
 const ZOHO_TOKEN_URL = "https://accounts.zoho.com/oauth/v2/token";
 const ZOHO_LEADS_MODULE = "Leads";
 
-// token cache
+// token cache (in-memory)
 let cachedAccessToken = null;
 let cachedAccessTokenExpiryMs = 0;
 
@@ -76,15 +51,18 @@ function digitsOnly(s) {
 }
 
 function formatZohoPhone(phoneCountryCode, phoneNumber) {
-  const cc = digitsOnly(phoneCountryCode);
+  const cc = digitsOnly(phoneCountryCode); // "+1" -> "1"
   const pn = digitsOnly(phoneNumber);
   if (!cc && !pn) return "";
-  return `${cc}${pn}`;
+  return `${cc}${pn}`; // digits only
 }
 
 function safeJoinArray(arr) {
   if (!Array.isArray(arr)) return "";
-  return arr.map(x => String(x || "").trim()).filter(Boolean).join(", ");
+  return arr
+    .map((x) => String(x || "").trim())
+    .filter(Boolean)
+    .join(", ");
 }
 
 function toBooleanValue(v) {
@@ -143,7 +121,9 @@ async function getZohoAccessToken() {
   const accessToken = data?.access_token;
   const expiresInSec = Number(data?.expires_in || 3600);
 
-  if (!accessToken) throw new Error("Zoho token refresh failed (no access_token returned).");
+  if (!accessToken) {
+    throw new Error("Zoho token refresh failed (no access_token returned).");
+  }
 
   cachedAccessToken = accessToken;
   cachedAccessTokenExpiryMs = Date.now() + expiresInSec * 1000;
@@ -184,7 +164,13 @@ async function zohoRequest(method, path, { params, data } = {}) {
 }
 
 // -------------------------
-// MAPPING
+// OPTIONAL: CMS ENDPOINTS (KEEP YOUR EXISTING ONES)
+// If your repo already has /api/geo/* and /api/surgeons/* routes implemented,
+// keep them there. This file won't break them.
+// -------------------------
+
+// -------------------------
+// SUBMISSIONS MAPPING
 // -------------------------
 function mapPartialToZohoLead(submission) {
   const phone = formatZohoPhone(submission.phone_country_code, submission.phone_number);
@@ -192,11 +178,15 @@ function mapPartialToZohoLead(submission) {
     First_Name: submission.first_name || "",
     Last_Name: submission.last_name || "",
     Email: submission.email || "",
+
     Phone: phone,
     Mobile: phone,
+
     Country: submission.current_location_country || "",
     State: submission.current_location_state || "",
+
     Session_ID: submission.session_id || "",
+
     Date_of_Birth: submission.date_of_birth || null,
     Intake_Date: isoOrNow(submission.submitted_at),
   });
@@ -204,61 +194,80 @@ function mapPartialToZohoLead(submission) {
 
 function mapCompleteToZohoLead(submission) {
   const phone = formatZohoPhone(submission.phone_country_code, submission.phone_number);
+
   return pruneEmpty({
     First_Name: submission.first_name || "",
     Last_Name: submission.last_name || "",
     Email: submission.email || "",
+
     Phone: phone,
     Mobile: phone,
+
     Country: submission.current_location_country || "",
     State: submission.current_location_state || "",
+
     Session_ID: submission.session_id || "",
+
     Surgeon_name_Lookup: submission.surgeon_id || "",
+
     Payment_Method: submission.payment_method || "",
     Procedure_Timeline: submission.timeline || "",
+
     Circumcised: toBooleanValue(submission.circumcised),
     Tobacco: toBooleanValue(submission.tobacco_use),
     Body_Type: submission.body_type || "",
+
     ED_history: submission.ed_history || "",
     Can_maintain_erection: submission.ed_maintain_with_or_without_meds || "",
+
     Active_STD: toBooleanValue(submission.active_std),
     STD_list: safeJoinArray(submission.std_list),
     Recent_Outbreak: toBooleanValue(submission.recent_outbreak_6mo),
+
     Previous_Penis_Surgeries: toBooleanValue(submission.prior_procedures),
+
     Medical_conditions_list: safeJoinArray(submission.medical_conditions_list),
+
     Outcome: submission.outcome || "",
+
     Date_of_Birth: submission.date_of_birth || null,
     Intake_Date: isoOrNow(submission.submitted_at),
   });
 }
 
 // -------------------------
-// SEARCH + CRUD (email priority)
+// ZOHO SEARCH + CRUD (EMAIL PRIORITY)
 // -------------------------
 async function searchLeadByEmail(email) {
   const e = String(email || "").trim();
   if (!e) return null;
+
   const json = await zohoRequest("GET", `/crm/v2/${ZOHO_LEADS_MODULE}/search`, {
     params: { criteria: `(Email:equals:${e})` },
   });
+
   return Array.isArray(json?.data) && json.data.length ? json.data[0] : null;
 }
 
 async function searchLeadByPhone(phoneDigits) {
   const p = digitsOnly(phoneDigits);
   if (!p) return null;
+
   const json = await zohoRequest("GET", `/crm/v2/${ZOHO_LEADS_MODULE}/search`, {
     params: { criteria: `(Phone:equals:${p}) or (Mobile:equals:${p})` },
   });
+
   return Array.isArray(json?.data) && json.data.length ? json.data[0] : null;
 }
 
 async function searchLeadBySessionId(sessionId) {
   const s = String(sessionId || "").trim();
   if (!s) return null;
+
   const json = await zohoRequest("GET", `/crm/v2/${ZOHO_LEADS_MODULE}/search`, {
     params: { criteria: `(Session_ID:equals:${s})` },
   });
+
   return Array.isArray(json?.data) && json.data.length ? json.data[0] : null;
 }
 
@@ -266,6 +275,7 @@ async function createLead(payload) {
   const json = await zohoRequest("POST", `/crm/v2/${ZOHO_LEADS_MODULE}`, {
     data: { data: [payload] },
   });
+
   const id = json?.data?.[0]?.details?.id;
   if (!id) throw new Error("Zoho createLead failed (no id returned).");
   return id;
@@ -275,6 +285,7 @@ async function updateLead(leadId, payload) {
   const json = await zohoRequest("PUT", `/crm/v2/${ZOHO_LEADS_MODULE}/${leadId}`, {
     data: { data: [payload] },
   });
+
   if (json?.data?.[0]?.status !== "success") {
     throw new Error(`Zoho updateLead failed: ${JSON.stringify(json?.data?.[0] || {})}`);
   }
@@ -284,8 +295,14 @@ async function updateLead(leadId, payload) {
 // -------------------------
 // ROUTES
 // -------------------------
+app.get("/", (req, res) => res.json({ ok: true, service: "himplant-eligibility-api" }));
 app.get("/health", (req, res) => res.json({ ok: true }));
 
+/**
+ * POST /api/submissions
+ * - partial: search email (priority), else phone; update if found else create
+ * - complete: search session_id, else email, else phone; update if found else create
+ */
 app.post("/api/submissions", async (req, res) => {
   try {
     const submission = req.body || {};
@@ -304,20 +321,23 @@ app.post("/api/submissions", async (req, res) => {
     }
 
     if (submissionType === "partial") {
-      if (!sessionId) return res.status(400).json({ success: false, error: "Partial requires session_id." });
+      if (!sessionId) {
+        return res.status(400).json({ success: false, error: "Partial submission requires session_id." });
+      }
 
       let lead = null;
       if (email) lead = await searchLeadByEmail(email); // email priority
       if (!lead && digitsOnly(phoneDigits)) lead = await searchLeadByPhone(phoneDigits);
 
       const payload = mapPartialToZohoLead(submission);
+
       if (lead?.id) await updateLead(lead.id, payload);
       else await createLead(payload);
 
       return res.json({ success: true });
     }
 
-    // complete: session -> email -> phone
+    // complete
     let lead = null;
     if (sessionId) lead = await searchLeadBySessionId(sessionId);
     if (!lead && email) lead = await searchLeadByEmail(email);
@@ -338,5 +358,16 @@ app.post("/api/submissions", async (req, res) => {
   }
 });
 
+// -------------------------
+// START
+// -------------------------
 const port = process.env.PORT || 10000;
 app.listen(port, () => console.log(`API listening on port ${port}`));
+
+/**
+ * TOMORROW (HIPAA SAFE LOCKDOWN):
+ * Replace the open CORS with a strict allowlist only:
+ *  - https://eligibility.himplant.com
+ *  - https://himplant.com
+ *  - https://www.himplant.com
+ */
