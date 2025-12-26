@@ -5,8 +5,8 @@ import fetch from "node-fetch";
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-// Keep EXACTLY like your old working setup for now:
-app.use(cors({ origin: "*", methods: ["GET", "POST", "OPTIONS", "PUT"] }));
+// OPEN CORS for testing (same as your old working setup)
+app.use(cors({ origin: "*", methods: ["GET", "POST", "PUT", "OPTIONS"] }));
 
 // Zoho US
 const ZOHO_ACCOUNTS = "https://accounts.zoho.com";
@@ -14,7 +14,7 @@ const ZOHO_API_BASE = "https://www.zohoapis.com";
 
 const { ZOHO_CLIENT_ID, ZOHO_CLIENT_SECRET, ZOHO_REFRESH_TOKEN } = process.env;
 
-// Zoho Surgeons module and field API names (CONFIRMED)
+// Surgeons module and fields (CONFIRMED)
 const MODULE_SURGEONS = "Surgeons";
 const FIELD_ACTIVE = "Active_Status";
 const FIELD_COUNTRY = "Country";
@@ -26,13 +26,16 @@ const FIELD_BOOK_EN = "Consult_Booking_EN";
 const FIELD_BOOK_ES = "Consult_Booking_ES";
 const FIELD_BOOK_AR = "Consult_Booking_AR";
 
-// Zoho Leads module
+// Leads module
 const MODULE_LEADS = "Leads";
 
-// Access token cache
+// Token cache
 let cachedAccessToken = null;
 let tokenExpiresAt = 0;
 
+// -------------------------
+// Zoho Auth + Request Helpers
+// -------------------------
 async function getAccessToken() {
   const now = Date.now();
   if (cachedAccessToken && now < tokenExpiresAt - 60_000) return cachedAccessToken;
@@ -60,84 +63,45 @@ async function getAccessToken() {
   return cachedAccessToken;
 }
 
-async function zohoGET(path) {
+async function zohoRequest(method, path, body) {
   const token = await getAccessToken();
   const res = await fetch(`${ZOHO_API_BASE}${path}`, {
-    headers: { Authorization: `Zoho-oauthtoken ${token}` },
-  });
-
-  const text = await res.text();
-  let data;
-  try {
-    data = JSON.parse(text);
-  } catch {
-    data = { raw: text };
-  }
-  if (!res.ok) throw new Error(`Zoho API error ${res.status}: ${JSON.stringify(data)}`);
-  return data;
-}
-
-async function zohoPOST(path, body) {
-  const token = await getAccessToken();
-  const res = await fetch(`${ZOHO_API_BASE}${path}`, {
-    method: "POST",
+    method,
     headers: {
       Authorization: `Zoho-oauthtoken ${token}`,
-      "Content-Type": "application/json",
+      ...(body ? { "Content-Type": "application/json" } : {}),
     },
-    body: JSON.stringify(body),
+    body: body ? JSON.stringify(body) : undefined,
   });
 
   const text = await res.text();
   let data;
   try {
-    data = JSON.parse(text);
+    data = text ? JSON.parse(text) : {};
   } catch {
     data = { raw: text };
   }
+
   if (!res.ok) throw new Error(`Zoho API error ${res.status}: ${JSON.stringify(data)}`);
   return data;
 }
 
-async function zohoPUT(path, body) {
-  const token = await getAccessToken();
-  const res = await fetch(`${ZOHO_API_BASE}${path}`, {
-    method: "PUT",
-    headers: {
-      Authorization: `Zoho-oauthtoken ${token}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
-
-  const text = await res.text();
-  let data;
-  try {
-    data = JSON.parse(text);
-  } catch {
-    data = { raw: text };
-  }
-  if (!res.ok) throw new Error(`Zoho API error ${res.status}: ${JSON.stringify(data)}`);
-  return data;
-}
+const zohoGET = (path) => zohoRequest("GET", path);
+const zohoPOST = (path, body) => zohoRequest("POST", path, body);
+const zohoPUT = (path, body) => zohoRequest("PUT", path, body);
 
 // -------------------------
-// Small helpers (no PHI logging)
+// Small helpers
 // -------------------------
 function digitsOnly(s) {
   return String(s || "").replace(/\D/g, "");
 }
 
-function formatZohoPhone(phone_country_code, phone_number) {
-  const cc = digitsOnly(phone_country_code); // "+1" -> "1"
-  const pn = digitsOnly(phone_number);
+function formatZohoPhone(countryCode, phoneNumber) {
+  const cc = digitsOnly(countryCode);
+  const pn = digitsOnly(phoneNumber);
   if (!cc && !pn) return "";
-  return `${cc}${pn}`; // digits only
-}
-
-function safeJoinArray(arr) {
-  if (!Array.isArray(arr)) return "";
-  return arr.map((x) => String(x || "").trim()).filter(Boolean).join(", ");
+  return `${cc}${pn}`;
 }
 
 function pruneEmpty(obj) {
@@ -150,6 +114,11 @@ function pruneEmpty(obj) {
   return out;
 }
 
+function safeJoinArray(arr) {
+  if (!Array.isArray(arr)) return "";
+  return arr.map((x) => String(x || "").trim()).filter(Boolean).join(", ");
+}
+
 function pickBookingUrl(record, lang) {
   const l = String(lang || "en").toLowerCase();
   if (l === "es") return record?.[FIELD_BOOK_ES] || record?.[FIELD_BOOK_EN] || "";
@@ -157,13 +126,16 @@ function pickBookingUrl(record, lang) {
   return record?.[FIELD_BOOK_EN] || "";
 }
 
+// -------------------------
+// Health
+// -------------------------
 app.get("/health", (req, res) => res.json({ ok: true }));
 
 // -------------------------
-// CMS ENDPOINTS (UNCHANGED BEHAVIOR)
+// CMS Endpoints (your old working behavior)
 // -------------------------
 
-// A) Active countries
+// Countries
 app.get("/api/geo/countries", async (req, res) => {
   try {
     const criteria = `(${FIELD_ACTIVE}:equals:true)`;
@@ -174,19 +146,17 @@ app.get("/api/geo/countries", async (req, res) => {
       const c = (r?.[FIELD_COUNTRY] || "").toString().trim();
       if (c) countries.add(c);
     }
-
     res.json(Array.from(countries).sort((a, b) => a.localeCompare(b)));
   } catch (e) {
     res.status(500).json({ error: "countries lookup failed", details: String(e.message || e) });
   }
 });
 
-// A2) Active states for a country (US only)
+// States (US only)
 app.get("/api/geo/states", async (req, res) => {
   try {
     const country = (req.query.country || "").toString().trim();
     if (!country) return res.status(400).json({ error: "country is required" });
-
     if (country !== "United States") return res.json([]);
 
     const criteria = `(${FIELD_ACTIVE}:equals:true) and (${FIELD_COUNTRY}:equals:${country})`;
@@ -197,23 +167,20 @@ app.get("/api/geo/states", async (req, res) => {
       const st = (r?.[FIELD_STATE] || "").toString().trim();
       if (st) states.add(st);
     }
-
     res.json(Array.from(states).sort((a, b) => a.localeCompare(b)));
   } catch (e) {
     res.status(500).json({ error: "states lookup failed", details: String(e.message || e) });
   }
 });
 
-// B) Active cities for a country (optionally filtered by US state)
+// Cities
 app.get("/api/geo/cities", async (req, res) => {
   try {
     const country = (req.query.country || "").toString().trim();
     const state = (req.query.state || "").toString().trim();
-
     if (!country) return res.status(400).json({ error: "country is required" });
 
     let criteria = `(${FIELD_ACTIVE}:equals:true) and (${FIELD_COUNTRY}:equals:${country})`;
-
     if (country === "United States" && state) {
       criteria = `(${FIELD_ACTIVE}:equals:true) and (${FIELD_COUNTRY}:equals:${country}) and (${FIELD_STATE}:equals:${state})`;
     }
@@ -225,14 +192,13 @@ app.get("/api/geo/cities", async (req, res) => {
       const city = (r?.[FIELD_CITY] || "").toString().trim();
       if (city) cities.add(city);
     }
-
     res.json(Array.from(cities).sort((a, b) => a.localeCompare(b)));
   } catch (e) {
     res.status(500).json({ error: "cities lookup failed", details: String(e.message || e) });
   }
 });
 
-// C) Surgeons for country+city (includes price). For US, optionally filter by state.
+// Surgeons list
 app.get("/api/surgeons", async (req, res) => {
   try {
     const country = (req.query.country || "").toString().trim();
@@ -243,12 +209,9 @@ app.get("/api/surgeons", async (req, res) => {
     if (!country) return res.status(400).json({ error: "country is required" });
     if (!city) return res.status(400).json({ error: "city is required" });
 
-    let criteria =
-      `(${FIELD_ACTIVE}:equals:true) and (${FIELD_COUNTRY}:equals:${country}) and (${FIELD_CITY}:equals:${city})`;
-
+    let criteria = `(${FIELD_ACTIVE}:equals:true) and (${FIELD_COUNTRY}:equals:${country}) and (${FIELD_CITY}:equals:${city})`;
     if (country === "United States" && state) {
-      criteria =
-        `(${FIELD_ACTIVE}:equals:true) and (${FIELD_COUNTRY}:equals:${country}) and (${FIELD_STATE}:equals:${state}) and (${FIELD_CITY}:equals:${city})`;
+      criteria = `(${FIELD_ACTIVE}:equals:true) and (${FIELD_COUNTRY}:equals:${country}) and (${FIELD_STATE}:equals:${state}) and (${FIELD_CITY}:equals:${city})`;
     }
 
     const data = await zohoGET(`/crm/v2/${MODULE_SURGEONS}/search?criteria=${encodeURIComponent(criteria)}`);
@@ -259,7 +222,6 @@ app.get("/api/surgeons", async (req, res) => {
         id: r.id,
         name: r?.[FIELD_NAME] || "",
         price: r?.[FIELD_PRICE] ?? null,
-        // keep your old boolean plus ALSO provide bookingUrl (helps your new UI)
         bookingAvailable: !!bookingUrl,
         bookingUrl: bookingUrl || null,
       };
@@ -271,7 +233,7 @@ app.get("/api/surgeons", async (req, res) => {
   }
 });
 
-// D) Selected surgeon details (price + booking link)
+// Surgeon detail
 app.get("/api/surgeons/:id", async (req, res) => {
   try {
     const surgeonId = (req.params.id || "").toString().trim();
@@ -296,13 +258,11 @@ app.get("/api/surgeons/:id", async (req, res) => {
 });
 
 // -------------------------
-// NEW: SUBMISSIONS ENDPOINT
+// Submissions (NEW)
 // -------------------------
-
 async function searchLeadByEmail(email) {
   const e = String(email || "").trim();
   if (!e) return null;
-
   const criteria = `(Email:equals:${e})`;
   const data = await zohoGET(`/crm/v2/${MODULE_LEADS}/search?criteria=${encodeURIComponent(criteria)}`);
   return (data?.data || [])[0] || null;
@@ -311,7 +271,6 @@ async function searchLeadByEmail(email) {
 async function searchLeadByPhone(phoneDigits) {
   const p = digitsOnly(phoneDigits);
   if (!p) return null;
-
   const criteria = `(Phone:equals:${p}) or (Mobile:equals:${p})`;
   const data = await zohoGET(`/crm/v2/${MODULE_LEADS}/search?criteria=${encodeURIComponent(criteria)}`);
   return (data?.data || [])[0] || null;
@@ -320,7 +279,6 @@ async function searchLeadByPhone(phoneDigits) {
 async function searchLeadBySessionId(sessionId) {
   const s = String(sessionId || "").trim();
   if (!s) return null;
-
   const criteria = `(Session_ID:equals:${s})`;
   const data = await zohoGET(`/crm/v2/${MODULE_LEADS}/search?criteria=${encodeURIComponent(criteria)}`);
   return (data?.data || [])[0] || null;
@@ -342,20 +300,15 @@ async function updateLead(leadId, payload) {
 
 function mapPartialToLead(submission) {
   const phone = formatZohoPhone(submission.phone_country_code, submission.phone_number);
-
   return pruneEmpty({
     First_Name: submission.first_name || "",
     Last_Name: submission.last_name || "",
     Email: submission.email || "",
-
     Phone: phone,
     Mobile: phone,
-
     Country: submission.current_location_country || "",
     State: submission.current_location_state || "",
-
     Session_ID: submission.session_id || "",
-
     Date_of_Birth: submission.date_of_birth || null,
     Intake_Date: submission.submitted_at || new Date().toISOString(),
   });
@@ -363,41 +316,29 @@ function mapPartialToLead(submission) {
 
 function mapCompleteToLead(submission) {
   const phone = formatZohoPhone(submission.phone_country_code, submission.phone_number);
-
   return pruneEmpty({
     First_Name: submission.first_name || "",
     Last_Name: submission.last_name || "",
     Email: submission.email || "",
-
     Phone: phone,
     Mobile: phone,
-
     Country: submission.current_location_country || "",
     State: submission.current_location_state || "",
-
     Session_ID: submission.session_id || "",
-
     Surgeon_name_Lookup: submission.surgeon_id || "",
-
     Payment_Method: submission.payment_method || "",
     Procedure_Timeline: submission.timeline || "",
-
     Circumcised: submission.circumcised,
     Tobacco: submission.tobacco_use,
     Body_Type: submission.body_type || "",
-
     ED_history: submission.ed_history || "",
     Can_maintain_erection: submission.ed_maintain_with_or_without_meds || "",
-
     Active_STD: submission.active_std,
     STD_list: safeJoinArray(submission.std_list),
     Recent_Outbreak: submission.recent_outbreak_6mo,
-
     Previous_Penis_Surgeries: submission.prior_procedures,
     Medical_conditions_list: safeJoinArray(submission.medical_conditions_list),
-
     Outcome: submission.outcome || "",
-
     Date_of_Birth: submission.date_of_birth || null,
     Intake_Date: submission.submitted_at || new Date().toISOString(),
   });
@@ -421,33 +362,38 @@ app.post("/api/submissions", async (req, res) => {
     }
 
     if (!sessionId && !email && !digitsOnly(phoneDigits)) {
-      return res.status(400).json({ success: false, error: "Need at least one identifier: session_id, email, or phone." });
+      return res.status(400).json({ success: false, error: "Need session_id, email, or phone." });
     }
 
     if (type === "partial") {
-      // EMAIL PRIORITY, then phone
+      // Email priority, then phone
       let lead = null;
       if (email) lead = await searchLeadByEmail(email);
       if (!lead && digitsOnly(phoneDigits)) lead = await searchLeadByPhone(phoneDigits);
 
       const payload = mapPartialToLead(submission);
-
       if (lead?.id) await updateLead(lead.id, payload);
       else await createLead(payload);
 
       return res.json({ success: true });
     }
 
-    // COMPLETE: session -> email -> phone
+    // complete: session -> email -> phone
     let lead = null;
     if (sessionId) lead = await searchLeadBySessionId(sessionId);
     if (!lead && email) lead = await searchLeadByEmail(email);
     if (!lead && digitsOnly(phoneDigits)) lead = await searchLeadByPhone(phoneDigits);
 
-    let payload = mapCompleteToLead(submission);
-    if (sessionId) payload = pruneEmpty({ ...payload, Session_ID: sessionId });
-
+    const payload = mapCompleteToLead(submission);
     if (lead?.id) await updateLead(lead.id, payload);
     else await createLead(payload);
 
-    return r
+    return res.json({ success: true });
+  } catch (e) {
+    console.error("[POST /api/submissions] error:", String(e.message || e));
+    return res.status(500).json({ success: false, error: "submission failed" });
+  }
+});
+
+const port = process.env.PORT || 10000;
+app.listen(port, () => console.log(`API running on port ${port}`));
