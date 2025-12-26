@@ -1,6 +1,6 @@
 import express from "express";
 import cors from "cors";
-import axios from "axios";
+import fetch from "node-fetch";
 
 const app = express();
 
@@ -12,8 +12,9 @@ const app = express();
 app.use(express.json({ limit: "1mb" }));
 
 /**
- * CORS (lock to your Webflow + frontend domains)
- * Add/remove domains as needed.
+ * CORS
+ * NOTE: For testing (without custom domain), you may need to add your Render frontend URL here too.
+ * Example: "https://himplant-eligibility.onrender.com"
  */
 const ALLOWED_ORIGINS = [
   "https://himplant.com",
@@ -41,75 +42,22 @@ const ZOHO_BASE = "https://www.zohoapis.com";
 const ZOHO_TOKEN_URL = "https://accounts.zoho.com/oauth/v2/token";
 const ZOHO_LEADS_MODULE = "Leads";
 
-// In-memory token cache (Render is ephemeral; this is fine)
+// In-memory token cache
 let cachedAccessToken = null;
 let cachedAccessTokenExpiryMs = 0;
 
 // -------------------------
-// ZOHO AUTH
-// -------------------------
-async function getZohoAccessToken() {
-  const now = Date.now();
-
-  // Refresh if missing or expiring soon
-  if (cachedAccessToken && now < cachedAccessTokenExpiryMs - 60_000) {
-    return cachedAccessToken;
-  }
-
-  const params = new URLSearchParams({
-    refresh_token: process.env.ZOHO_REFRESH_TOKEN,
-    client_id: process.env.ZOHO_CLIENT_ID,
-    client_secret: process.env.ZOHO_CLIENT_SECRET,
-    grant_type: "refresh_token",
-  });
-
-  const resp = await axios.post(`${ZOHO_TOKEN_URL}?${params.toString()}`, null, {
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    timeout: 20_000,
-  });
-
-  const accessToken = resp?.data?.access_token;
-  const expiresInSec = Number(resp?.data?.expires_in || 3600);
-
-  if (!accessToken) {
-    throw new Error("Zoho token refresh failed (no access_token returned).");
-  }
-
-  cachedAccessToken = accessToken;
-  cachedAccessTokenExpiryMs = Date.now() + expiresInSec * 1000;
-  return cachedAccessToken;
-}
-
-async function zohoRequest(method, path, { params, data } = {}) {
-  const token = await getZohoAccessToken();
-  const url = `${ZOHO_BASE}${path}`;
-
-  return axios.request({
-    method,
-    url,
-    params,
-    data,
-    timeout: 25_000,
-    headers: {
-      Authorization: `Zoho-oauthtoken ${token}`,
-      "Content-Type": "application/json",
-    },
-  });
-}
-
-// -------------------------
-// HELPERS
+// BASIC HELPERS
 // -------------------------
 function digitsOnly(s) {
   return String(s || "").replace(/\D/g, "");
 }
 
 function formatZohoPhone(phoneCountryCode, phoneNumber) {
-  // digits-only, prepend digits-only country code
   const cc = digitsOnly(phoneCountryCode); // "+1" -> "1"
   const pn = digitsOnly(phoneNumber);
   if (!cc && !pn) return "";
-  return `${cc}${pn}`;
+  return `${cc}${pn}`; // digits only
 }
 
 function safeJoinArray(arr) {
@@ -136,9 +84,6 @@ function isoOrNow(iso) {
   return d.toISOString();
 }
 
-/**
- * Avoid overwriting Zoho fields with blank values.
- */
 function pruneEmpty(obj) {
   const out = {};
   for (const [k, v] of Object.entries(obj)) {
@@ -151,7 +96,83 @@ function pruneEmpty(obj) {
 }
 
 // -------------------------
-// ZOHO LEAD MAPPERS
+// ZOHO AUTH (refresh -> access token)
+// -------------------------
+async function getZohoAccessToken() {
+  const now = Date.now();
+  if (cachedAccessToken && now < cachedAccessTokenExpiryMs - 60_000) {
+    return cachedAccessToken;
+  }
+
+  const params = new URLSearchParams({
+    refresh_token: process.env.ZOHO_REFRESH_TOKEN,
+    client_id: process.env.ZOHO_CLIENT_ID,
+    client_secret: process.env.ZOHO_CLIENT_SECRET,
+    grant_type: "refresh_token",
+  });
+
+  const resp = await fetch(`${ZOHO_TOKEN_URL}?${params.toString()}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+  });
+
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    throw new Error(`Zoho token refresh failed: ${resp.status} ${text}`);
+  }
+
+  const data = await resp.json();
+  const accessToken = data?.access_token;
+  const expiresInSec = Number(data?.expires_in || 3600);
+
+  if (!accessToken) {
+    throw new Error("Zoho token refresh failed (no access_token returned).");
+  }
+
+  cachedAccessToken = accessToken;
+  cachedAccessTokenExpiryMs = Date.now() + expiresInSec * 1000;
+  return cachedAccessToken;
+}
+
+async function zohoRequest(method, path, { params, data } = {}) {
+  const token = await getZohoAccessToken();
+  const url = new URL(`${ZOHO_BASE}${path}`);
+
+  if (params) {
+    for (const [k, v] of Object.entries(params)) {
+      if (v !== undefined && v !== null && String(v).trim() !== "") {
+        url.searchParams.set(k, v);
+      }
+    }
+  }
+
+  const resp = await fetch(url.toString(), {
+    method,
+    headers: {
+      Authorization: `Zoho-oauthtoken ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: data ? JSON.stringify(data) : undefined,
+  });
+
+  const text = await resp.text().catch(() => "");
+  let json = null;
+  try {
+    json = text ? JSON.parse(text) : null;
+  } catch {
+    json = null;
+  }
+
+  if (!resp.ok) {
+    // HIPAA: do not include patient payloads in thrown errors
+    throw new Error(`Zoho API error ${resp.status}: ${text}`);
+  }
+
+  return json;
+}
+
+// -------------------------
+// MAPPING (Zoho Lead field API names)
 // -------------------------
 function mapPartialToZohoLead(submission) {
   const phone = formatZohoPhone(submission.phone_country_code, submission.phone_number);
@@ -161,18 +182,14 @@ function mapPartialToZohoLead(submission) {
     Last_Name: submission.last_name || "",
     Email: submission.email || "",
 
-    // store to both
     Phone: phone,
     Mobile: phone,
 
-    // Patient current location
     Country: submission.current_location_country || "",
     State: submission.current_location_state || "",
 
-    // Session link
     Session_ID: submission.session_id || "",
 
-    // Dates
     Date_of_Birth: submission.date_of_birth || null,
     Intake_Date: isoOrNow(submission.submitted_at),
   });
@@ -189,79 +206,65 @@ function mapCompleteToZohoLead(submission) {
     Phone: phone,
     Mobile: phone,
 
-    // Patient current location
     Country: submission.current_location_country || "",
     State: submission.current_location_state || "",
 
-    // Session link
     Session_ID: submission.session_id || "",
 
-    // Surgeon selection lookup (record id)
     Surgeon_name_Lookup: submission.surgeon_id || "",
 
-    // Preferences
     Payment_Method: submission.payment_method || "",
     Procedure_Timeline: submission.timeline || "",
 
-    // Health
     Circumcised: toBooleanValue(submission.circumcised),
     Tobacco: toBooleanValue(submission.tobacco_use),
     Body_Type: submission.body_type || "",
 
-    // ED
     ED_history: submission.ed_history || "",
     Can_maintain_erection: submission.ed_maintain_with_or_without_meds || "",
 
-    // STD
     Active_STD: toBooleanValue(submission.active_std),
     STD_list: safeJoinArray(submission.std_list),
     Recent_Outbreak: toBooleanValue(submission.recent_outbreak_6mo),
 
-    // Prior procedures
     Previous_Penis_Surgeries: toBooleanValue(submission.prior_procedures),
 
-    // Conditions
     Medical_conditions_list: safeJoinArray(submission.medical_conditions_list),
 
-    // Outcome
     Outcome: submission.outcome || "",
 
-    // Dates
     Date_of_Birth: submission.date_of_birth || null,
     Intake_Date: isoOrNow(submission.submitted_at),
   });
 }
 
 // -------------------------
-// ZOHO SEARCH HELPERS (EMAIL PRIORITY)
+// ZOHO CRUD HELPERS
 // -------------------------
 async function searchLeadByEmail(email) {
   const emailSafe = String(email || "").trim();
   if (!emailSafe) return null;
 
   const criteria = `(Email:equals:${emailSafe})`;
-  const resp = await zohoRequest("GET", `/crm/v2/${ZOHO_LEADS_MODULE}/search`, {
+  const json = await zohoRequest("GET", `/crm/v2/${ZOHO_LEADS_MODULE}/search`, {
     params: { criteria },
   });
 
-  const data = resp?.data?.data;
-  if (Array.isArray(data) && data.length > 0) return data[0];
-  return null;
+  const data = json?.data;
+  return Array.isArray(data) && data.length > 0 ? data[0] : null;
 }
 
 async function searchLeadByPhone(phoneDigits) {
   const phoneSafe = digitsOnly(phoneDigits);
   if (!phoneSafe) return null;
 
-  // Search phone stored in Phone or Mobile
   const criteria = `(Phone:equals:${phoneSafe}) or (Mobile:equals:${phoneSafe})`;
-  const resp = await zohoRequest("GET", `/crm/v2/${ZOHO_LEADS_MODULE}/search`, {
+  const json = await zohoRequest("GET", `/crm/v2/${ZOHO_LEADS_MODULE}/search`, {
     params: { criteria },
   });
 
-  const data = resp?.data?.data;
-  if (Array.isArray(data) && data.length > 0) return data[0];
-  return null;
+  const data = json?.data;
+  return Array.isArray(data) && data.length > 0 ? data[0] : null;
 }
 
 async function searchLeadBySessionId(sessionId) {
@@ -269,35 +272,31 @@ async function searchLeadBySessionId(sessionId) {
   if (!s) return null;
 
   const criteria = `(Session_ID:equals:${s})`;
-  const resp = await zohoRequest("GET", `/crm/v2/${ZOHO_LEADS_MODULE}/search`, {
+  const json = await zohoRequest("GET", `/crm/v2/${ZOHO_LEADS_MODULE}/search`, {
     params: { criteria },
   });
 
-  const data = resp?.data?.data;
-  if (Array.isArray(data) && data.length > 0) return data[0];
-  return null;
+  const data = json?.data;
+  return Array.isArray(data) && data.length > 0 ? data[0] : null;
 }
 
-// -------------------------
-// ZOHO CRUD HELPERS
-// -------------------------
-async function createLead(zohoLeadPayload) {
-  const resp = await zohoRequest("POST", `/crm/v2/${ZOHO_LEADS_MODULE}`, {
-    data: { data: [zohoLeadPayload] },
+async function createLead(payload) {
+  const json = await zohoRequest("POST", `/crm/v2/${ZOHO_LEADS_MODULE}`, {
+    data: { data: [payload] },
   });
 
-  const created = resp?.data?.data?.[0];
+  const created = json?.data?.[0];
   const id = created?.details?.id;
   if (!id) throw new Error("Zoho createLead failed (no id returned).");
   return id;
 }
 
-async function updateLead(leadId, zohoLeadPayload) {
-  const resp = await zohoRequest("PUT", `/crm/v2/${ZOHO_LEADS_MODULE}/${leadId}`, {
-    data: { data: [zohoLeadPayload] },
+async function updateLead(leadId, payload) {
+  const json = await zohoRequest("PUT", `/crm/v2/${ZOHO_LEADS_MODULE}/${leadId}`, {
+    data: { data: [payload] },
   });
 
-  const updated = resp?.data?.data?.[0];
+  const updated = json?.data?.[0];
   if (updated?.status !== "success") {
     throw new Error(`Zoho updateLead failed: ${JSON.stringify(updated || {})}`);
   }
@@ -312,20 +311,17 @@ app.get("/health", (req, res) => res.json({ ok: true }));
 /**
  * POST /api/submissions
  *
- * PARTIAL:
- * - Email priority:
- *   1) search by Email
- *   2) if none, search by Phone/Mobile
- * - Update if found else create
+ * PARTIAL (Email priority):
+ * 1) search by Email
+ * 2) if none, search by Phone/Mobile
+ * 3) update if found else create
  *
- * COMPLETE:
- * - Priority:
- *   1) search by Session_ID
- *   2) if none, search by Email
- *   3) if none, search by Phone/Mobile
- * - If found -> update
- * - If not found -> create (so you never lose the completed intake)
- * - Always sets Session_ID on update/create (link future updates)
+ * COMPLETE (fallback if Session_ID not found):
+ * 1) search by Session_ID
+ * 2) if none, search by Email
+ * 3) if none, search by Phone/Mobile
+ * 4) update if found else create
+ * Always sets Session_ID whenever provided.
  */
 app.post("/api/submissions", async (req, res) => {
   try {
@@ -343,7 +339,6 @@ app.post("/api/submissions", async (req, res) => {
     const email = String(submission.email || "").trim();
     const phoneDigits = formatZohoPhone(submission.phone_country_code, submission.phone_number);
 
-    // Require at least ONE identifier for any submission
     if (!sessionId && !email && !digitsOnly(phoneDigits)) {
       return res.status(400).json({
         success: false,
@@ -352,14 +347,12 @@ app.post("/api/submissions", async (req, res) => {
     }
 
     if (submissionType === "partial") {
-      // For partial, session_id is required for linking
       if (!sessionId) {
         return res.status(400).json({ success: false, error: "Partial submission requires session_id." });
       }
 
-      // EMAIL PRIORITY
       let lead = null;
-      if (email) lead = await searchLeadByEmail(email);
+      if (email) lead = await searchLeadByEmail(email);              // EMAIL PRIORITY
       if (!lead && digitsOnly(phoneDigits)) lead = await searchLeadByPhone(phoneDigits);
 
       const zohoPayload = mapPartialToZohoLead(submission);
@@ -373,36 +366,28 @@ app.post("/api/submissions", async (req, res) => {
       return res.json({ success: true });
     }
 
-    // COMPLETE submission
+    // COMPLETE
     let lead = null;
 
-    // 1) session id
     if (sessionId) lead = await searchLeadBySessionId(sessionId);
-
-    // 2) fallback: email
-    if (!lead && email) lead = await searchLeadByEmail(email);
-
-    // 3) fallback: phone
+    if (!lead && email) lead = await searchLeadByEmail(email);       // EMAIL PRIORITY
     if (!lead && digitsOnly(phoneDigits)) lead = await searchLeadByPhone(phoneDigits);
 
     const zohoPayload = mapCompleteToZohoLead(submission);
 
     if (lead?.id) {
-      // Ensure Session_ID is set in case we matched by email/phone
+      // Ensure Session_ID is set if we matched by email/phone
       if (sessionId) {
         await updateLead(lead.id, pruneEmpty({ ...zohoPayload, Session_ID: sessionId }));
       } else {
         await updateLead(lead.id, zohoPayload);
       }
     } else {
-      // No match at all: create new lead so intake is not lost
-      // If Last_Name is required in your Zoho, ensure frontend always sends it.
       await createLead(zohoPayload);
     }
 
     return res.json({ success: true });
   } catch (err) {
-    // Do NOT include req.body in logs (PHI)
     console.error("[POST /api/submissions] error:", err?.message || err);
     return res.status(500).json({ success: false, error: "Server error." });
   }
