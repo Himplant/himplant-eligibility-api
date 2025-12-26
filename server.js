@@ -4,19 +4,23 @@ import fetch from "node-fetch";
 
 const app = express();
 
-/**
- * HIPAA SAFETY
- * - DO NOT log request bodies
- * - DO NOT store PHI anywhere besides Zoho
- */
 app.use(express.json({ limit: "1mb" }));
 
 /**
- * CORS
- * NOTE: For testing (without custom domain), you may need to add your Render frontend URL here too.
- * Example: "https://himplant-eligibility.onrender.com"
+ * CORS:
+ * This is what broke your CMS endpoints.
+ * You were testing from Render/Webflow, but you only allowed himplant.com + eligibility.himplant.com.
+ *
+ * For TODAY:
+ * - allow himplant.com + eligibility.himplant.com
+ * - AND allow any *.onrender.com (your frontend host)
+ * - AND allow any *.webflow.io (Webflow staging)
+ *
+ * For TOMORROW (after custom domains):
+ * - remove the wildcard *.onrender.com and *.webflow.io lines
+ * - keep only your real domains
  */
-const ALLOWED_ORIGINS = [
+const STRICT_ALLOWED_ORIGINS = [
   "https://himplant.com",
   "https://www.himplant.com",
   "https://eligibility.himplant.com",
@@ -25,10 +29,19 @@ const ALLOWED_ORIGINS = [
 app.use(
   cors({
     origin: (origin, callback) => {
-      // Allow curl/server-to-server (no origin header)
+      // Allow curl/server-to-server
       if (!origin) return callback(null, true);
-      if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
-      return callback(new Error("Not allowed by CORS"));
+
+      // Production domains (always)
+      if (STRICT_ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+
+      // ✅ Allow Render frontend during testing
+      if (origin.endsWith(".onrender.com")) return callback(null, true);
+
+      // ✅ Allow Webflow staging during testing
+      if (origin.endsWith(".webflow.io")) return callback(null, true);
+
+      return callback(new Error(`Not allowed by CORS: ${origin}`));
     },
     methods: ["GET", "POST", "PUT", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
@@ -47,17 +60,17 @@ let cachedAccessToken = null;
 let cachedAccessTokenExpiryMs = 0;
 
 // -------------------------
-// BASIC HELPERS
+// HELPERS
 // -------------------------
 function digitsOnly(s) {
   return String(s || "").replace(/\D/g, "");
 }
 
 function formatZohoPhone(phoneCountryCode, phoneNumber) {
-  const cc = digitsOnly(phoneCountryCode); // "+1" -> "1"
+  const cc = digitsOnly(phoneCountryCode);
   const pn = digitsOnly(phoneNumber);
   if (!cc && !pn) return "";
-  return `${cc}${pn}`; // digits only
+  return `${cc}${pn}`;
 }
 
 function safeJoinArray(arr) {
@@ -96,7 +109,7 @@ function pruneEmpty(obj) {
 }
 
 // -------------------------
-// ZOHO AUTH (refresh -> access token)
+// ZOHO AUTH
 // -------------------------
 async function getZohoAccessToken() {
   const now = Date.now();
@@ -163,33 +176,24 @@ async function zohoRequest(method, path, { params, data } = {}) {
     json = null;
   }
 
-  if (!resp.ok) {
-    // HIPAA: do not include patient payloads in thrown errors
-    throw new Error(`Zoho API error ${resp.status}: ${text}`);
-  }
-
+  if (!resp.ok) throw new Error(`Zoho API error ${resp.status}: ${text}`);
   return json;
 }
 
 // -------------------------
-// MAPPING (Zoho Lead field API names)
+// MAPPING
 // -------------------------
 function mapPartialToZohoLead(submission) {
   const phone = formatZohoPhone(submission.phone_country_code, submission.phone_number);
-
   return pruneEmpty({
     First_Name: submission.first_name || "",
     Last_Name: submission.last_name || "",
     Email: submission.email || "",
-
     Phone: phone,
     Mobile: phone,
-
     Country: submission.current_location_country || "",
     State: submission.current_location_state || "",
-
     Session_ID: submission.session_id || "",
-
     Date_of_Birth: submission.date_of_birth || null,
     Intake_Date: isoOrNow(submission.submitted_at),
   });
@@ -197,96 +201,69 @@ function mapPartialToZohoLead(submission) {
 
 function mapCompleteToZohoLead(submission) {
   const phone = formatZohoPhone(submission.phone_country_code, submission.phone_number);
-
   return pruneEmpty({
     First_Name: submission.first_name || "",
     Last_Name: submission.last_name || "",
     Email: submission.email || "",
-
     Phone: phone,
     Mobile: phone,
-
     Country: submission.current_location_country || "",
     State: submission.current_location_state || "",
-
     Session_ID: submission.session_id || "",
-
     Surgeon_name_Lookup: submission.surgeon_id || "",
-
     Payment_Method: submission.payment_method || "",
     Procedure_Timeline: submission.timeline || "",
-
     Circumcised: toBooleanValue(submission.circumcised),
     Tobacco: toBooleanValue(submission.tobacco_use),
     Body_Type: submission.body_type || "",
-
     ED_history: submission.ed_history || "",
     Can_maintain_erection: submission.ed_maintain_with_or_without_meds || "",
-
     Active_STD: toBooleanValue(submission.active_std),
     STD_list: safeJoinArray(submission.std_list),
     Recent_Outbreak: toBooleanValue(submission.recent_outbreak_6mo),
-
     Previous_Penis_Surgeries: toBooleanValue(submission.prior_procedures),
-
     Medical_conditions_list: safeJoinArray(submission.medical_conditions_list),
-
     Outcome: submission.outcome || "",
-
     Date_of_Birth: submission.date_of_birth || null,
     Intake_Date: isoOrNow(submission.submitted_at),
   });
 }
 
 // -------------------------
-// ZOHO CRUD HELPERS
+// SEARCH + CRUD
 // -------------------------
 async function searchLeadByEmail(email) {
-  const emailSafe = String(email || "").trim();
-  if (!emailSafe) return null;
-
-  const criteria = `(Email:equals:${emailSafe})`;
+  const e = String(email || "").trim();
+  if (!e) return null;
   const json = await zohoRequest("GET", `/crm/v2/${ZOHO_LEADS_MODULE}/search`, {
-    params: { criteria },
+    params: { criteria: `(Email:equals:${e})` },
   });
-
-  const data = json?.data;
-  return Array.isArray(data) && data.length > 0 ? data[0] : null;
+  return Array.isArray(json?.data) && json.data.length ? json.data[0] : null;
 }
 
 async function searchLeadByPhone(phoneDigits) {
-  const phoneSafe = digitsOnly(phoneDigits);
-  if (!phoneSafe) return null;
-
-  const criteria = `(Phone:equals:${phoneSafe}) or (Mobile:equals:${phoneSafe})`;
+  const p = digitsOnly(phoneDigits);
+  if (!p) return null;
   const json = await zohoRequest("GET", `/crm/v2/${ZOHO_LEADS_MODULE}/search`, {
-    params: { criteria },
+    params: { criteria: `(Phone:equals:${p}) or (Mobile:equals:${p})` },
   });
-
-  const data = json?.data;
-  return Array.isArray(data) && data.length > 0 ? data[0] : null;
+  return Array.isArray(json?.data) && json.data.length ? json.data[0] : null;
 }
 
 async function searchLeadBySessionId(sessionId) {
   const s = String(sessionId || "").trim();
   if (!s) return null;
-
-  const criteria = `(Session_ID:equals:${s})`;
   const json = await zohoRequest("GET", `/crm/v2/${ZOHO_LEADS_MODULE}/search`, {
-    params: { criteria },
+    params: { criteria: `(Session_ID:equals:${s})` },
   });
-
-  const data = json?.data;
-  return Array.isArray(data) && data.length > 0 ? data[0] : null;
+  return Array.isArray(json?.data) && json.data.length ? json.data[0] : null;
 }
 
 async function createLead(payload) {
   const json = await zohoRequest("POST", `/crm/v2/${ZOHO_LEADS_MODULE}`, {
     data: { data: [payload] },
   });
-
-  const created = json?.data?.[0];
-  const id = created?.details?.id;
+  const id = json?.data?.[0]?.details?.id;
   if (!id) throw new Error("Zoho createLead failed (no id returned).");
   return id;
 }
@@ -295,10 +272,8 @@ async function updateLead(leadId, payload) {
   const json = await zohoRequest("PUT", `/crm/v2/${ZOHO_LEADS_MODULE}/${leadId}`, {
     data: { data: [payload] },
   });
-
-  const updated = json?.data?.[0];
-  if (updated?.status !== "success") {
-    throw new Error(`Zoho updateLead failed: ${JSON.stringify(updated || {})}`);
+  if (json?.data?.[0]?.status !== "success") {
+    throw new Error(`Zoho updateLead failed: ${JSON.stringify(json?.data?.[0] || {})}`);
   }
   return true;
 }
@@ -308,31 +283,13 @@ async function updateLead(leadId, payload) {
 // -------------------------
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-/**
- * POST /api/submissions
- *
- * PARTIAL (Email priority):
- * 1) search by Email
- * 2) if none, search by Phone/Mobile
- * 3) update if found else create
- *
- * COMPLETE (fallback if Session_ID not found):
- * 1) search by Session_ID
- * 2) if none, search by Email
- * 3) if none, search by Phone/Mobile
- * 4) update if found else create
- * Always sets Session_ID whenever provided.
- */
 app.post("/api/submissions", async (req, res) => {
   try {
     const submission = req.body || {};
     const submissionType = String(submission.submission_type || "").toLowerCase();
 
     if (!["partial", "complete"].includes(submissionType)) {
-      return res.status(400).json({
-        success: false,
-        error: "submission_type must be 'partial' or 'complete'.",
-      });
+      return res.status(400).json({ success: false, error: "submission_type must be 'partial' or 'complete'." });
     }
 
     const sessionId = String(submission.session_id || "").trim();
@@ -340,50 +297,35 @@ app.post("/api/submissions", async (req, res) => {
     const phoneDigits = formatZohoPhone(submission.phone_country_code, submission.phone_number);
 
     if (!sessionId && !email && !digitsOnly(phoneDigits)) {
-      return res.status(400).json({
-        success: false,
-        error: "Submission requires at least one identifier: session_id, email, or phone.",
-      });
+      return res.status(400).json({ success: false, error: "Need session_id, email, or phone." });
     }
 
     if (submissionType === "partial") {
-      if (!sessionId) {
-        return res.status(400).json({ success: false, error: "Partial submission requires session_id." });
-      }
+      if (!sessionId) return res.status(400).json({ success: false, error: "Partial requires session_id." });
 
       let lead = null;
-      if (email) lead = await searchLeadByEmail(email);              // EMAIL PRIORITY
+      if (email) lead = await searchLeadByEmail(email); // email priority
       if (!lead && digitsOnly(phoneDigits)) lead = await searchLeadByPhone(phoneDigits);
 
-      const zohoPayload = mapPartialToZohoLead(submission);
-
-      if (lead?.id) {
-        await updateLead(lead.id, zohoPayload);
-      } else {
-        await createLead(zohoPayload);
-      }
+      const payload = mapPartialToZohoLead(submission);
+      if (lead?.id) await updateLead(lead.id, payload);
+      else await createLead(payload);
 
       return res.json({ success: true });
     }
 
-    // COMPLETE
+    // complete: session_id -> email -> phone
     let lead = null;
-
     if (sessionId) lead = await searchLeadBySessionId(sessionId);
-    if (!lead && email) lead = await searchLeadByEmail(email);       // EMAIL PRIORITY
+    if (!lead && email) lead = await searchLeadByEmail(email);
     if (!lead && digitsOnly(phoneDigits)) lead = await searchLeadByPhone(phoneDigits);
 
-    const zohoPayload = mapCompleteToZohoLead(submission);
+    const payload = mapCompleteToZohoLead(submission);
 
     if (lead?.id) {
-      // Ensure Session_ID is set if we matched by email/phone
-      if (sessionId) {
-        await updateLead(lead.id, pruneEmpty({ ...zohoPayload, Session_ID: sessionId }));
-      } else {
-        await updateLead(lead.id, zohoPayload);
-      }
+      await updateLead(lead.id, sessionId ? pruneEmpty({ ...payload, Session_ID: sessionId }) : payload);
     } else {
-      await createLead(zohoPayload);
+      await createLead(payload);
     }
 
     return res.json({ success: true });
@@ -393,10 +335,5 @@ app.post("/api/submissions", async (req, res) => {
   }
 });
 
-// -------------------------
-// START
-// -------------------------
 const port = process.env.PORT || 10000;
-app.listen(port, () => {
-  console.log(`API listening on port ${port}`);
-});
+app.listen(port, () => console.log(`API listening on port ${port}`));
