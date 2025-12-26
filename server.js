@@ -8,17 +8,17 @@ app.use(express.json({ limit: "1mb" }));
 
 /**
  * CORS:
- * This is what broke your CMS endpoints.
- * You were testing from Render/Webflow, but you only allowed himplant.com + eligibility.himplant.com.
+ * You are currently testing from a Lovable preview origin like:
+ * https://id-preview--....lovable.app
  *
- * For TODAY:
- * - allow himplant.com + eligibility.himplant.com
- * - AND allow any *.onrender.com (your frontend host)
- * - AND allow any *.webflow.io (Webflow staging)
+ * For TODAY (testing):
+ * - allow production domains
+ * - allow *.onrender.com
+ * - allow *.webflow.io
+ * - allow *.lovable.app  ✅
  *
  * For TOMORROW (after custom domains):
- * - remove the wildcard *.onrender.com and *.webflow.io lines
- * - keep only your real domains
+ * - remove the wildcard allowances and lock to your custom domains only.
  */
 const STRICT_ALLOWED_ORIGINS = [
   "https://himplant.com",
@@ -26,20 +26,26 @@ const STRICT_ALLOWED_ORIGINS = [
   "https://eligibility.himplant.com",
 ];
 
+function originAllowedByWildcard(origin) {
+  // allow subdomains for testing environments
+  return (
+    origin.endsWith(".onrender.com") ||
+    origin.endsWith(".webflow.io") ||
+    origin.endsWith(".lovable.app")
+  );
+}
+
 app.use(
   cors({
     origin: (origin, callback) => {
-      // Allow curl/server-to-server
+      // Allow curl/server-to-server (no origin header)
       if (!origin) return callback(null, true);
 
-      // Production domains (always)
+      // Always allow production domains
       if (STRICT_ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
 
-      // ✅ Allow Render frontend during testing
-      if (origin.endsWith(".onrender.com")) return callback(null, true);
-
-      // ✅ Allow Webflow staging during testing
-      if (origin.endsWith(".webflow.io")) return callback(null, true);
+      // Allow known preview/staging hosts (today)
+      if (originAllowedByWildcard(origin)) return callback(null, true);
 
       return callback(new Error(`Not allowed by CORS: ${origin}`));
     },
@@ -230,7 +236,7 @@ function mapCompleteToZohoLead(submission) {
 }
 
 // -------------------------
-// SEARCH + CRUD
+// SEARCH + CRUD (email priority)
 // -------------------------
 async function searchLeadByEmail(email) {
   const e = String(email || "").trim();
@@ -314,7 +320,7 @@ app.post("/api/submissions", async (req, res) => {
       return res.json({ success: true });
     }
 
-    // complete: session_id -> email -> phone
+    // complete: session -> email -> phone
     let lead = null;
     if (sessionId) lead = await searchLeadBySessionId(sessionId);
     if (!lead && email) lead = await searchLeadByEmail(email);
