@@ -7,18 +7,7 @@ const app = express();
 app.use(express.json({ limit: "1mb" }));
 
 /**
- * CORS:
- * You are currently testing from a Lovable preview origin like:
- * https://id-preview--....lovable.app
- *
- * For TODAY (testing):
- * - allow production domains
- * - allow *.onrender.com
- * - allow *.webflow.io
- * - allow *.lovable.app  ✅
- *
- * For TOMORROW (after custom domains):
- * - remove the wildcard allowances and lock to your custom domains only.
+ * ✅ Production domains (keep these forever)
  */
 const STRICT_ALLOWED_ORIGINS = [
   "https://himplant.com",
@@ -26,8 +15,19 @@ const STRICT_ALLOWED_ORIGINS = [
   "https://eligibility.himplant.com",
 ];
 
-function originAllowedByWildcard(origin) {
-  // allow subdomains for testing environments
+/**
+ * ✅ Emergency testing override:
+ * In Render env vars, set:
+ *   CORS_ALLOW_ALL=true
+ * ONLY for debugging. Turn off after.
+ */
+const CORS_ALLOW_ALL = String(process.env.CORS_ALLOW_ALL || "").toLowerCase() === "true";
+
+/**
+ * ✅ Testing wildcard origins (today)
+ * Lovable preview is: *.lovable.app
+ */
+function isAllowedTestingOrigin(origin) {
   return (
     origin.endsWith(".onrender.com") ||
     origin.endsWith(".webflow.io") ||
@@ -38,14 +38,17 @@ function originAllowedByWildcard(origin) {
 app.use(
   cors({
     origin: (origin, callback) => {
-      // Allow curl/server-to-server (no origin header)
+      // server-to-server / curl
       if (!origin) return callback(null, true);
 
-      // Always allow production domains
+      // emergency mode
+      if (CORS_ALLOW_ALL) return callback(null, true);
+
+      // strict allowlist
       if (STRICT_ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
 
-      // Allow known preview/staging hosts (today)
-      if (originAllowedByWildcard(origin)) return callback(null, true);
+      // testing allowlist
+      if (isAllowedTestingOrigin(origin)) return callback(null, true);
 
       return callback(new Error(`Not allowed by CORS: ${origin}`));
     },
@@ -61,7 +64,7 @@ const ZOHO_BASE = "https://www.zohoapis.com";
 const ZOHO_TOKEN_URL = "https://accounts.zoho.com/oauth/v2/token";
 const ZOHO_LEADS_MODULE = "Leads";
 
-// In-memory token cache
+// token cache
 let cachedAccessToken = null;
 let cachedAccessTokenExpiryMs = 0;
 
@@ -81,10 +84,7 @@ function formatZohoPhone(phoneCountryCode, phoneNumber) {
 
 function safeJoinArray(arr) {
   if (!Array.isArray(arr)) return "";
-  return arr
-    .map((x) => String(x || "").trim())
-    .filter(Boolean)
-    .join(", ");
+  return arr.map(x => String(x || "").trim()).filter(Boolean).join(", ");
 }
 
 function toBooleanValue(v) {
@@ -106,8 +106,7 @@ function isoOrNow(iso) {
 function pruneEmpty(obj) {
   const out = {};
   for (const [k, v] of Object.entries(obj)) {
-    if (v === undefined) continue;
-    if (v === null) continue;
+    if (v === undefined || v === null) continue;
     if (typeof v === "string" && v.trim() === "") continue;
     out[k] = v;
   }
@@ -144,9 +143,7 @@ async function getZohoAccessToken() {
   const accessToken = data?.access_token;
   const expiresInSec = Number(data?.expires_in || 3600);
 
-  if (!accessToken) {
-    throw new Error("Zoho token refresh failed (no access_token returned).");
-  }
+  if (!accessToken) throw new Error("Zoho token refresh failed (no access_token returned).");
 
   cachedAccessToken = accessToken;
   cachedAccessTokenExpiryMs = Date.now() + expiresInSec * 1000;
