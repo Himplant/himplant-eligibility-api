@@ -36,11 +36,17 @@ const ZOHO_ACCOUNTS = "https://accounts.zoho.com";
 const ZOHO_API_BASE = "https://www.zohoapis.com";
 
 // Env
-const { ZOHO_CLIENT_ID, ZOHO_CLIENT_SECRET, ZOHO_REFRESH_TOKEN } = process.env;
+const {
+  ZOHO_CLIENT_ID,
+  ZOHO_CLIENT_SECRET,
+  ZOHO_REFRESH_TOKEN,
+  CREATE_ZOHO_ERROR_TASKS,
+} = process.env;
 
 // Modules
 const MODULE_SURGEONS = "Surgeons";
 const MODULE_LEADS = "Leads";
+const MODULE_TASKS = "Tasks";
 
 // Surgeons fields (Zoho API names)
 const FIELD_ACTIVE = "Active_Status";
@@ -161,6 +167,7 @@ function toMultilineText(value) {
 
 /**
  * Phone normalization to E.164: +<countrycode><number> (no spaces)
+ * (You said you’ll improve for all countries later.)
  */
 const ISO_TO_DIAL = {
   US: "1",
@@ -198,8 +205,7 @@ function normalizePhoneE164(countryCodeOrDial, phoneNumber) {
   const ccRaw = String(countryCodeOrDial || "").trim().toUpperCase();
 
   const dial =
-    ISO_TO_DIAL[ccRaw] ||
-    (digitsOnly(ccRaw) ? digitsOnly(ccRaw) : "");
+    ISO_TO_DIAL[ccRaw] || (digitsOnly(ccRaw) ? digitsOnly(ccRaw) : "");
 
   if (!dial && !pn) return "";
   if (!dial) return pn ? `+${pn}` : "";
@@ -229,6 +235,22 @@ function pickBookingUrl(record, lang) {
   if (l === "es") return record?.[FIELD_BOOK_ES] || record?.[FIELD_BOOK_EN] || "";
   if (l === "ar") return record?.[FIELD_BOOK_AR] || record?.[FIELD_BOOK_EN] || "";
   return record?.[FIELD_BOOK_EN] || "";
+}
+
+function todayYYYYMMDD() {
+  // Zoho Due_Date expects YYYY-MM-DD
+  return new Date().toISOString().slice(0, 10);
+}
+
+function safeJsonStringify(obj, maxLen = 28000) {
+  let s = "";
+  try {
+    s = JSON.stringify(obj, null, 2);
+  } catch {
+    s = String(obj);
+  }
+  if (s.length > maxLen) return s.slice(0, maxLen) + "\n\n[TRUNCATED]";
+  return s;
 }
 
 // -------------------------
@@ -282,13 +304,78 @@ async function zohoRequest(method, path, body) {
     data = { raw: text };
   }
 
-  if (!res.ok) throw new Error(`Zoho API error ${res.status}: ${JSON.stringify(data)}`);
+  if (!res.ok) {
+    const err = new Error(`Zoho API error ${res.status}`);
+    err.zoho = data;
+    err.httpStatus = res.status;
+    throw err;
+  }
   return data;
 }
 
 const zohoGET = (path) => zohoRequest("GET", path);
 const zohoPOST = (path, body) => zohoRequest("POST", path, body);
 const zohoPUT = (path, body) => zohoRequest("PUT", path, body);
+
+// -------------------------
+// Zoho Task creation on errors
+// -------------------------
+function shouldCreateErrorTasks() {
+  if (CREATE_ZOHO_ERROR_TASKS === undefined) return true; // default ON
+  return String(CREATE_ZOHO_ERROR_TASKS).toLowerCase() === "true";
+}
+
+/**
+ * Creates a Zoho Task with Due_Date=today and Description containing:
+ * - error details
+ * - full submission payload JSON
+ * Required fields in YOUR Zoho:
+ * - Subject
+ * - Status (must be "Backlogged")
+ */
+async function createZohoErrorTask({
+  leadId,
+  submissionType,
+  sessionId,
+  email,
+  phoneE164,
+  errorMessage,
+  zohoDetails,
+  submissionPayload,
+}) {
+  if (!shouldCreateErrorTasks()) return;
+
+  const subjectBits = [
+    "Eligibility API Error",
+    submissionType ? `(${submissionType})` : "",
+    email ? `email:${email}` : "",
+    phoneE164 ? `phone:${phoneE164}` : "",
+  ].filter(Boolean);
+
+  const subject = subjectBits.join(" ").trim() || "Eligibility API Error";
+
+  const description =
+    `Error Message:\n${errorMessage || "(none)"}\n\n` +
+    `Zoho Details:\n${safeJsonStringify(zohoDetails || {}, 8000)}\n\n` +
+    `Context:\nsession_id=${sessionId || ""}\nemail=${email || ""}\nphone=${phoneE164 || ""}\n\n` +
+    `Payload:\n${safeJsonStringify(submissionPayload || {}, 28000)}`;
+
+  const taskRecord = pruneEmpty({
+    Subject: subject,
+    Status: "Backlogged",      // ✅ REQUIRED in your Zoho
+    Due_Date: todayYYYYMMDD(), // ✅ same-day due date
+    Description: description,
+    // Link to the Lead if we have it (Tasks can relate to Leads via Who_Id)
+    Who_Id: leadId || null,
+  });
+
+  try {
+    await zohoPOST(`/crm/v2/${MODULE_TASKS}`, { data: [taskRecord] });
+  } catch (e) {
+    // Never throw from here; avoid cascading failure loops
+    console.error("[Zoho Task] failed:", String(e.message || e));
+  }
+}
 
 // -------------------------
 // Health
@@ -474,20 +561,34 @@ async function searchLeadByPhoneE164(phoneE164) {
 
 async function createLead(payload) {
   const resp = await zohoPOST(`/crm/v2/${MODULE_LEADS}`, { data: [payload] });
-  const id = resp?.data?.[0]?.details?.id;
-  if (!id) throw new Error("createLead failed (no id returned)");
+  const first = resp?.data?.[0];
+  if (first?.status !== "success") {
+    const err = new Error("createLead failed");
+    err.zoho = first || resp;
+    throw err;
+  }
+  const id = first?.details?.id;
+  if (!id) {
+    const err = new Error("createLead failed (no id returned)");
+    err.zoho = first || resp;
+    throw err;
+  }
   return id;
 }
 
 async function updateLead(leadId, payload) {
   const resp = await zohoPUT(`/crm/v2/${MODULE_LEADS}/${leadId}`, { data: [payload] });
-  const status = resp?.data?.[0]?.status;
-  if (status !== "success") throw new Error(`updateLead failed: ${JSON.stringify(resp?.data?.[0] || {})}`);
+  const first = resp?.data?.[0];
+  if (first?.status !== "success") {
+    const err = new Error("updateLead failed");
+    err.zoho = first || resp;
+    throw err;
+  }
   return true;
 }
 
 // -------------------------
-// Mapping to Zoho Leads API names (your list)
+// Mapping to Zoho Leads API names
 // -------------------------
 function mapLeadToZohoLead(submission) {
   const phone = normalizePhoneE164(submission.phone_country_code, submission.phone_number);
@@ -535,7 +636,6 @@ function mapCompleteToZohoLead(submission) {
   const phone = normalizePhoneE164(submission.phone_country_code, submission.phone_number);
 
   return pruneEmpty({
-    // Identity
     First_Name: nullableText(submission.first_name),
     Last_Name: nullableText(submission.last_name),
     Email: nullableText(submission.email),
@@ -543,32 +643,26 @@ function mapCompleteToZohoLead(submission) {
     Mobile: phone || null,
     Date_of_Birth: nullableText(submission.date_of_birth),
 
-    // Location
     Country: nullableText(getCurrentCountry(submission)),
     State: nullableText(getCurrentState(submission)),
 
-    // Linker
     Session_ID: nullableText(submission.session_id),
-
-    // Lookup
     Surgeon_name_Lookup: nullableText(submission.surgeon_id),
 
-    // Intake fields
     Payment_Method: nullableText(submission.payment_method),
     Procedure_Timeline: nullableText(submission.timeline),
 
-    // boolean-looking fields (Zoho text/picklist safe)
     Circumcised: boolToYesNo(submission.circumcised),
     Tobacco: boolToYesNo(submission.tobacco_use),
     ED_history: boolToYesNo(submission.ed_history),
     Active_STD: boolToYesNo(submission.active_std),
 
     Can_maintain_erection:
-      submission.ed_maintain_with_or_without_meds === null || submission.ed_maintain_with_or_without_meds === undefined
+      submission.ed_maintain_with_or_without_meds === null ||
+      submission.ed_maintain_with_or_without_meds === undefined
         ? null
         : boolToYesNo(submission.ed_maintain_with_or_without_meds),
 
-    // ✅ jsonarray fields
     STD_list: toZohoJsonArray(submission.std_list),
     Previous_Penis_Surgeries: toZohoJsonArray(submission.prior_procedure_list),
 
@@ -577,7 +671,6 @@ function mapCompleteToZohoLead(submission) {
         ? null
         : boolToYesNo(submission.recent_outbreak_6mo),
 
-    // Multiline text field
     Medical_conditions_list: toMultilineText(submission.medical_conditions_list),
 
     Body_Type: nullableText(submission.body_type),
@@ -588,16 +681,38 @@ function mapCompleteToZohoLead(submission) {
 }
 
 // -------------------------
+// Duplicate phone safe retry
+// -------------------------
+function stripPhoneFields(payload) {
+  const { Phone, Mobile, ...rest } = payload || {};
+  return rest;
+}
+
+function isDuplicatePhoneZohoError(zohoErr) {
+  const code = zohoErr?.code;
+  const api = zohoErr?.details?.api_name;
+  return code === "DUPLICATE_DATA" && (api === "Phone" || api === "Mobile");
+}
+
+// -------------------------
 // Submissions endpoint
 // - lead: create/update by Email -> Phone; always set Session_ID
 // - partial: create/update by Email -> Phone
 // - complete: update by Session_ID -> Email -> Phone; if matched by email/phone, bind Session_ID
+//
+// On any Zoho error, create a Zoho Task for manual resolution.
 // -------------------------
 app.post("/api/submissions", async (req, res) => {
-  try {
-    const submission = req.body || {};
-    const type = String(submission.submission_type || "").toLowerCase();
+  const submission = req.body || {};
+  const type = String(submission.submission_type || "").toLowerCase();
 
+  const sessionId = String(submission.session_id || "").trim();
+  const email = String(submission.email || "").trim();
+  const phoneE164 = normalizePhoneE164(submission.phone_country_code, submission.phone_number);
+
+  let lead = null;
+
+  try {
     if (!["lead", "partial", "complete"].includes(type)) {
       return res.status(400).json({
         success: false,
@@ -605,11 +720,6 @@ app.post("/api/submissions", async (req, res) => {
       });
     }
 
-    const sessionId = String(submission.session_id || "").trim();
-    const email = String(submission.email || "").trim();
-    const phoneE164 = normalizePhoneE164(submission.phone_country_code, submission.phone_number);
-
-    // Validate minimal identifiers
     if ((type === "lead" || type === "complete") && !sessionId) {
       return res.status(400).json({ success: false, error: `${type} submission requires session_id.` });
     }
@@ -618,50 +728,73 @@ app.post("/api/submissions", async (req, res) => {
       return res.status(400).json({ success: false, error: "Need session_id, email, or phone." });
     }
 
-    if (type === "lead") {
-      let lead = null;
-      if (email) lead = await searchLeadByEmail(email);
-      if (!lead && phoneE164) lead = await searchLeadByPhoneE164(phoneE164);
-
-      const payload = mapLeadToZohoLead(submission);
-
-      if (lead?.id) await updateLead(lead.id, payload);
-      else await createLead(payload);
-
-      return res.json({ success: true });
-    }
-
-    if (type === "partial") {
-      let lead = null;
-      if (email) lead = await searchLeadByEmail(email);
-      if (!lead && phoneE164) lead = await searchLeadByPhoneE164(phoneE164);
-
-      const payload = mapPartialToZohoLead(submission);
-
-      if (lead?.id) await updateLead(lead.id, payload);
-      else await createLead(payload);
-
-      return res.json({ success: true });
-    }
-
-    // COMPLETE: Session_ID -> Email -> Phone
-    let lead = null;
-    if (sessionId) lead = await searchLeadBySessionId(sessionId);
+    // Find existing lead
+    if (type === "complete" && sessionId) lead = await searchLeadBySessionId(sessionId);
     if (!lead && email) lead = await searchLeadByEmail(email);
     if (!lead && phoneE164) lead = await searchLeadByPhoneE164(phoneE164);
 
-    const payload = mapCompleteToZohoLead(submission);
+    // Build payload per type
+    const payload =
+      type === "lead"
+        ? mapLeadToZohoLead(submission)
+        : type === "partial"
+          ? mapPartialToZohoLead(submission)
+          : mapCompleteToZohoLead(submission);
 
-    // Bind new session to existing lead if we matched by email/phone
-    if (lead?.id && sessionId) payload.Session_ID = sessionId;
+    // If complete and we matched by email/phone, bind session id to record
+    if (type === "complete" && lead?.id && sessionId) payload.Session_ID = sessionId;
 
-    if (lead?.id) await updateLead(lead.id, payload);
-    else await createLead(payload);
+    // Upsert
+    if (lead?.id) {
+      try {
+        await updateLead(lead.id, payload);
+      } catch (e) {
+        const zohoErr = e?.zoho || null;
+
+        // If duplicate phone, retry update without phone fields, and still log task for manual resolution
+        if (isDuplicatePhoneZohoError(zohoErr)) {
+          await updateLead(lead.id, stripPhoneFields(payload));
+
+          await createZohoErrorTask({
+            leadId: lead.id,
+            submissionType: type,
+            sessionId,
+            email,
+            phoneE164,
+            errorMessage: "Duplicate phone detected; updated lead without Phone/Mobile. Manual review needed.",
+            zohoDetails: zohoErr,
+            submissionPayload: submission,
+          });
+
+          return res.json({ success: true, warning: "updated_without_phone_due_to_duplicate" });
+        }
+
+        throw e;
+      }
+    } else {
+      const newId = await createLead(payload);
+      lead = { id: newId };
+    }
 
     return res.json({ success: true });
   } catch (e) {
-    // PHI-safe error logging (no req.body)
-    console.error("[POST /api/submissions] error:", String(e.message || e));
+    const zohoErr = e?.zoho || null;
+
+    // Create Zoho Task on any failure (best-effort)
+    await createZohoErrorTask({
+      leadId: lead?.id || null,
+      submissionType: type,
+      sessionId,
+      email,
+      phoneE164,
+      errorMessage: String(e?.message || e),
+      zohoDetails: zohoErr,
+      submissionPayload: submission,
+    });
+
+    // PHI-safe server log (no req.body)
+    console.error("[POST /api/submissions] error:", String(e?.message || e));
+
     return res.status(500).json({ success: false, error: "submission failed" });
   }
 });
