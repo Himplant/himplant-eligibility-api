@@ -23,11 +23,7 @@ const PROD_ORIGINS = [
 function isLovablePreviewOrigin(origin) {
   if (!origin) return false;
   const o = String(origin).toLowerCase();
-  return (
-    o.endsWith(".lovable.app") ||
-    o.endsWith(".lovable.dev") ||
-    o.includes("lovable")
-  );
+  return o.endsWith(".lovable.app") || o.endsWith(".lovable.dev") || o.includes("lovable");
 }
 
 app.use(
@@ -109,12 +105,67 @@ function nullableText(v) {
 
 /**
  * Zoho sometimes configures “boolean-looking” fields as TEXT or PICKLIST.
- * Convert booleans to text values (best-practice).
+ * Convert booleans/text-boolean-ish values to Yes/No strings.
  */
 function boolToYesNo(v) {
   if (v === true) return "Yes";
   if (v === false) return "No";
+
+  // Handle frontend that might already send "Yes"/"No"
+  if (typeof v === "string") {
+    const s = v.trim().toLowerCase();
+    if (s === "yes") return "Yes";
+    if (s === "no") return "No";
+    if (s === "true") return "Yes";
+    if (s === "false") return "No";
+  }
+
   return null;
+}
+
+/**
+ * ✅ Zoho jsonarray helper
+ * Zoho jsonarray fields require a REAL array, not a comma string or JSON string.
+ * Handles:
+ * - array: ["HPV","HIV/AIDS"]
+ * - JSON string: '["HPV","HIV/AIDS"]'
+ * - comma string: "HPV, HIV/AIDS"
+ */
+function toZohoJsonArray(value) {
+  if (value === undefined || value === null) return null;
+
+  // If frontend sends string, it may be JSON or CSV
+  if (typeof value === "string") {
+    const s = value.trim();
+    if (!s) return null;
+
+    // Try JSON array string first
+    if (s.startsWith("[") && s.endsWith("]")) {
+      try {
+        const parsed = JSON.parse(s);
+        if (Array.isArray(parsed)) {
+          const clean = parsed.map((x) => String(x || "").trim()).filter(Boolean);
+          return clean.length ? clean : null;
+        }
+      } catch {
+        // fall through
+      }
+    }
+
+    // Fall back to comma-splitting
+    const parts = s.split(",").map((x) => x.trim()).filter(Boolean);
+    return parts.length ? parts : null;
+  }
+
+  // If frontend sends array already
+  if (Array.isArray(value)) {
+    const clean = value.map((x) => String(x || "").trim()).filter(Boolean);
+    return clean.length ? clean : null;
+  }
+
+  // Fallback
+  const s = String(value).trim();
+  return s ? [s] : null;
 }
 
 /**
@@ -155,9 +206,7 @@ function normalizePhoneE164(countryCodeOrDial, phoneNumber) {
   const pn = digitsOnly(raw);
   const ccRaw = String(countryCodeOrDial || "").trim().toUpperCase();
 
-  const dial =
-    ISO_TO_DIAL[ccRaw] ||
-    (digitsOnly(ccRaw) ? digitsOnly(ccRaw) : "");
+  const dial = ISO_TO_DIAL[ccRaw] || (digitsOnly(ccRaw) ? digitsOnly(ccRaw) : "");
 
   if (!dial && !pn) return "";
   if (!dial) return pn ? `+${pn}` : "";
@@ -447,10 +496,7 @@ async function updateLead(leadId, payload) {
 // Mapping to Zoho Leads API names (your list)
 // -------------------------
 function mapLeadToZohoLead(submission) {
-  const phone = normalizePhoneE164(
-    submission.phone_country_code,
-    submission.phone_number
-  );
+  const phone = normalizePhoneE164(submission.phone_country_code, submission.phone_number);
 
   return pruneEmpty({
     First_Name: nullableText(submission.first_name),
@@ -471,10 +517,7 @@ function mapLeadToZohoLead(submission) {
 }
 
 function mapPartialToZohoLead(submission) {
-  const phone = normalizePhoneE164(
-    submission.phone_country_code,
-    submission.phone_number
-  );
+  const phone = normalizePhoneE164(submission.phone_country_code, submission.phone_number);
 
   return pruneEmpty({
     First_Name: nullableText(submission.first_name),
@@ -495,10 +538,7 @@ function mapPartialToZohoLead(submission) {
 }
 
 function mapCompleteToZohoLead(submission) {
-  const phone = normalizePhoneE164(
-    submission.phone_country_code,
-    submission.phone_number
-  );
+  const phone = normalizePhoneE164(submission.phone_country_code, submission.phone_number);
 
   return pruneEmpty({
     First_Name: nullableText(submission.first_name),
@@ -529,11 +569,11 @@ function mapCompleteToZohoLead(submission) {
         ? null
         : boolToYesNo(submission.ed_maintain_with_or_without_meds),
 
-    STD_list: safeJoinArray(submission.std_list),
+    // ✅ FIX: Zoho expects jsonarray here
+    STD_list: toZohoJsonArray(submission.std_list),
 
     Recent_Outbreak:
-      submission.recent_outbreak_6mo === null ||
-      submission.recent_outbreak_6mo === undefined
+      submission.recent_outbreak_6mo === null || submission.recent_outbreak_6mo === undefined
         ? null
         : boolToYesNo(submission.recent_outbreak_6mo),
 
@@ -565,10 +605,7 @@ app.post("/api/submissions", async (req, res) => {
 
     const sessionId = String(submission.session_id || "").trim();
     const email = String(submission.email || "").trim();
-    const phoneE164 = normalizePhoneE164(
-      submission.phone_country_code,
-      submission.phone_number
-    );
+    const phoneE164 = normalizePhoneE164(submission.phone_country_code, submission.phone_number);
 
     if ((type === "lead" || type === "complete") && !sessionId) {
       return res.status(400).json({
