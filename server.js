@@ -5,8 +5,21 @@ import fetch from "node-fetch";
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-// OPEN CORS for testing (same as your old working setup)
-app.use(cors({ origin: "*", methods: ["GET", "POST", "PUT", "OPTIONS"] }));
+/**
+ * CORS
+ * During final hardening, restrict to:
+ * - https://eligibility.himplant.com
+ * - https://himplant.com
+ * - https://www.himplant.com
+ *
+ * For now, you can keep permissive while testing.
+ */
+app.use(
+  cors({
+    origin: "*",
+    methods: ["GET", "POST", "PUT", "OPTIONS"],
+  })
+);
 
 // Zoho US
 const ZOHO_ACCOUNTS = "https://accounts.zoho.com";
@@ -97,11 +110,12 @@ function digitsOnly(s) {
   return String(s || "").replace(/\D/g, "");
 }
 
-function formatZohoPhone(countryCode, phoneNumber) {
-  const cc = digitsOnly(countryCode);
-  const pn = digitsOnly(phoneNumber);
-  if (!cc && !pn) return "";
-  return `${cc}${pn}`;
+function safeJoinArray(arr) {
+  if (!Array.isArray(arr)) return "";
+  return arr
+    .map((x) => String(x || "").trim())
+    .filter(Boolean)
+    .join(", ");
 }
 
 function pruneEmpty(obj) {
@@ -114,16 +128,84 @@ function pruneEmpty(obj) {
   return out;
 }
 
-function safeJoinArray(arr) {
-  if (!Array.isArray(arr)) return "";
-  return arr.map((x) => String(x || "").trim()).filter(Boolean).join(", ");
-}
-
 function pickBookingUrl(record, lang) {
   const l = String(lang || "en").toLowerCase();
   if (l === "es") return record?.[FIELD_BOOK_ES] || record?.[FIELD_BOOK_EN] || "";
   if (l === "ar") return record?.[FIELD_BOOK_AR] || record?.[FIELD_BOOK_EN] || "";
   return record?.[FIELD_BOOK_EN] || "";
+}
+
+/**
+ * Phone normalization
+ * Frontend may send country as ISO ("US", "MX") per the questionnaire doc :contentReference[oaicite:7]{index=7},
+ * but Zoho needs +<dialcode><number> with no spaces per your requirement.
+ *
+ * We:
+ * - Accept already-E.164 numbers (if phone_number includes '+')
+ * - Otherwise map ISO -> dial code (common set) and fallback to digits-only countryCode
+ */
+const ISO_TO_DIAL = {
+  US: "1",
+  CA: "1",
+  MX: "52",
+  CO: "57",
+  AE: "971",
+  SA: "966",
+  JO: "962",
+  GB: "44",
+  ES: "34",
+  FR: "33",
+  DE: "49",
+  IT: "39",
+  BR: "55",
+  AR: "54",
+  CL: "56",
+  PE: "51",
+  EC: "593",
+  PA: "507",
+  CR: "506",
+  DO: "1",
+};
+
+function normalizePhoneE164(countryCodeOrDial, phoneNumber) {
+  const raw = String(phoneNumber || "").trim();
+
+  // If number already looks like E.164 (+...), keep only '+' + digits
+  if (raw.startsWith("+")) {
+    const cleaned = "+" + digitsOnly(raw);
+    return cleaned.length > 1 ? cleaned : "";
+  }
+
+  const pn = digitsOnly(raw);
+  const ccRaw = String(countryCodeOrDial || "").trim().toUpperCase();
+
+  // If country code is ISO, map it; if it's digits, use digits
+  const dial =
+    ISO_TO_DIAL[ccRaw] ||
+    (digitsOnly(ccRaw) ? digitsOnly(ccRaw) : "");
+
+  if (!dial && !pn) return "";
+  if (!dial) {
+    // If we don't have a dial code, we at least avoid returning a broken '+'
+    return pn ? `+${pn}` : "";
+  }
+  return pn ? `+${dial}${pn}` : `+${dial}`;
+}
+
+function getCurrentCountry(submission) {
+  return (
+    submission.current_location_country ||
+    submission.location_country ||
+    ""
+  );
+}
+
+function getCurrentState(submission) {
+  return (
+    submission.current_location_state ||
+    submission.location_state ||
+    ""
+  );
 }
 
 // -------------------------
@@ -132,7 +214,7 @@ function pickBookingUrl(record, lang) {
 app.get("/health", (req, res) => res.json({ ok: true }));
 
 // -------------------------
-// CMS Endpoints (your old working behavior)
+// CMS Endpoints (existing behavior)
 // -------------------------
 
 // Countries
@@ -258,7 +340,7 @@ app.get("/api/surgeons/:id", async (req, res) => {
 });
 
 // -------------------------
-// Submissions (NEW)
+// Submissions (LEAD + PARTIAL + COMPLETE)
 // -------------------------
 async function searchLeadByEmail(email) {
   const e = String(email || "").trim();
@@ -268,18 +350,18 @@ async function searchLeadByEmail(email) {
   return (data?.data || [])[0] || null;
 }
 
-async function searchLeadByPhone(phoneDigits) {
-  const p = digitsOnly(phoneDigits);
-  if (!p) return null;
-  const criteria = `(Phone:equals:${p}) or (Mobile:equals:${p})`;
-  const data = await zohoGET(`/crm/v2/${MODULE_LEADS}/search?criteria=${encodeURIComponent(criteria)}`);
-  return (data?.data || [])[0] || null;
-}
-
 async function searchLeadBySessionId(sessionId) {
   const s = String(sessionId || "").trim();
   if (!s) return null;
   const criteria = `(Session_ID:equals:${s})`;
+  const data = await zohoGET(`/crm/v2/${MODULE_LEADS}/search?criteria=${encodeURIComponent(criteria)}`);
+  return (data?.data || [])[0] || null;
+}
+
+async function searchLeadByPhoneE164(phoneE164) {
+  const p = String(phoneE164 || "").trim();
+  if (!p) return null;
+  const criteria = `(Phone:equals:${p}) or (Mobile:equals:${p})`;
   const data = await zohoGET(`/crm/v2/${MODULE_LEADS}/search?criteria=${encodeURIComponent(criteria)}`);
   return (data?.data || [])[0] || null;
 }
@@ -298,47 +380,93 @@ async function updateLead(leadId, payload) {
   return true;
 }
 
-function mapPartialToLead(submission) {
-  const phone = formatZohoPhone(submission.phone_country_code, submission.phone_number);
+/**
+ * ZOHO FIELD API NAMES (per your list)
+ * First_Name, Last_Name, Date_of_Birth, Email, Mobile, Phone,
+ * Country, State, Surgeon_name_Lookup, Payment_Method, Procedure_Timeline,
+ * Circumcised, Tobacco, ED_history, Can_maintain_erection, Active_STD,
+ * STD_list, Recent_Outbreak, Previous_Penis_Surgeries, Medical_conditions_list,
+ * Body_Type, Outcome, Intake_Date
+ */
+
+function mapLeadToZohoLead(submission) {
+  const phone = normalizePhoneE164(submission.phone_country_code, submission.phone_number);
   return pruneEmpty({
     First_Name: submission.first_name || "",
     Last_Name: submission.last_name || "",
     Email: submission.email || "",
     Phone: phone,
     Mobile: phone,
-    Country: submission.current_location_country || "",
-    State: submission.current_location_state || "",
+
+    // "Country" and "State" should map to "current" per your request:
+    Country: getCurrentCountry(submission),
+    State: getCurrentState(submission),
+
+    Session_ID: submission.session_id || "",
+
+    // Landing may include surgeon/location selection:
+    Surgeon_name_Lookup: submission.surgeon_id || "",
+    Intake_Date: submission.submitted_at || new Date().toISOString(),
+  });
+}
+
+function mapPartialToZohoLead(submission) {
+  const phone = normalizePhoneE164(submission.phone_country_code, submission.phone_number);
+  return pruneEmpty({
+    First_Name: submission.first_name || "",
+    Last_Name: submission.last_name || "",
+    Email: submission.email || "",
+    Phone: phone,
+    Mobile: phone,
+
+    Country: getCurrentCountry(submission),
+    State: getCurrentState(submission),
+
     Session_ID: submission.session_id || "",
     Date_of_Birth: submission.date_of_birth || null,
     Intake_Date: submission.submitted_at || new Date().toISOString(),
   });
 }
 
-function mapCompleteToLead(submission) {
-  const phone = formatZohoPhone(submission.phone_country_code, submission.phone_number);
+function mapCompleteToZohoLead(submission) {
+  const phone = normalizePhoneE164(submission.phone_country_code, submission.phone_number);
+
   return pruneEmpty({
     First_Name: submission.first_name || "",
     Last_Name: submission.last_name || "",
     Email: submission.email || "",
     Phone: phone,
     Mobile: phone,
-    Country: submission.current_location_country || "",
-    State: submission.current_location_state || "",
+
+    Country: getCurrentCountry(submission),
+    State: getCurrentState(submission),
+
     Session_ID: submission.session_id || "",
+
     Surgeon_name_Lookup: submission.surgeon_id || "",
+
     Payment_Method: submission.payment_method || "",
     Procedure_Timeline: submission.timeline || "",
+
     Circumcised: submission.circumcised,
     Tobacco: submission.tobacco_use,
-    Body_Type: submission.body_type || "",
-    ED_history: submission.ed_history || "",
-    Can_maintain_erection: submission.ed_maintain_with_or_without_meds || "",
+
+    ED_history: submission.ed_history,
+    Can_maintain_erection: submission.ed_maintain_with_or_without_meds,
+
     Active_STD: submission.active_std,
     STD_list: safeJoinArray(submission.std_list),
     Recent_Outbreak: submission.recent_outbreak_6mo,
-    Previous_Penis_Surgeries: submission.prior_procedures,
+
+    // IMPORTANT FIX: user requested this maps to prior_procedure_list (not the boolean)
+    Previous_Penis_Surgeries: safeJoinArray(submission.prior_procedure_list),
+
     Medical_conditions_list: safeJoinArray(submission.medical_conditions_list),
+
+    Body_Type: submission.body_type || "",
+
     Outcome: submission.outcome || "",
+
     Date_of_Birth: submission.date_of_birth || null,
     Intake_Date: submission.submitted_at || new Date().toISOString(),
   });
@@ -349,42 +477,72 @@ app.post("/api/submissions", async (req, res) => {
     const submission = req.body || {};
     const type = String(submission.submission_type || "").toLowerCase();
 
-    if (type !== "partial" && type !== "complete") {
-      return res.status(400).json({ success: false, error: "submission_type must be 'partial' or 'complete'." });
+    if (type !== "lead" && type !== "partial" && type !== "complete") {
+      return res.status(400).json({
+        success: false,
+        error: "submission_type must be 'lead', 'partial', or 'complete'.",
+      });
     }
 
     const sessionId = String(submission.session_id || "").trim();
     const email = String(submission.email || "").trim();
-    const phoneDigits = formatZohoPhone(submission.phone_country_code, submission.phone_number);
+    const phoneE164 = normalizePhoneE164(submission.phone_country_code, submission.phone_number);
 
-    if (type === "partial" && !sessionId) {
-      return res.status(400).json({ success: false, error: "Partial submission requires session_id." });
+    // Basic requirements
+    if ((type === "lead" || type === "complete") && !sessionId) {
+      return res.status(400).json({ success: false, error: `${type} submission requires session_id.` });
     }
 
-    if (!sessionId && !email && !digitsOnly(phoneDigits)) {
+    if (!sessionId && !email && !phoneE164) {
       return res.status(400).json({ success: false, error: "Need session_id, email, or phone." });
     }
 
-    if (type === "partial") {
-      // Email priority, then phone
+    // -------------------------
+    // LEAD: create/update early (Email first), always store Session_ID
+    // -------------------------
+    if (type === "lead") {
       let lead = null;
-      if (email) lead = await searchLeadByEmail(email);
-      if (!lead && digitsOnly(phoneDigits)) lead = await searchLeadByPhone(phoneDigits);
 
-      const payload = mapPartialToLead(submission);
+      // Per your spec: search by Email first; set Session_ID
+      if (email) lead = await searchLeadByEmail(email);
+      if (!lead && phoneE164) lead = await searchLeadByPhoneE164(phoneE164);
+
+      const payload = mapLeadToZohoLead(submission);
+
       if (lead?.id) await updateLead(lead.id, payload);
       else await createLead(payload);
 
       return res.json({ success: true });
     }
 
-    // complete: session -> email -> phone
+    // -------------------------
+    // PARTIAL: best-effort updates (Email first, then phone)
+    // -------------------------
+    if (type === "partial") {
+      let lead = null;
+
+      if (email) lead = await searchLeadByEmail(email);
+      if (!lead && phoneE164) lead = await searchLeadByPhoneE164(phoneE164);
+
+      const payload = mapPartialToZohoLead(submission);
+
+      if (lead?.id) await updateLead(lead.id, payload);
+      else await createLead(payload);
+
+      return res.json({ success: true });
+    }
+
+    // -------------------------
+    // COMPLETE: session_id first, then email, then phone
+    // -------------------------
     let lead = null;
+
     if (sessionId) lead = await searchLeadBySessionId(sessionId);
     if (!lead && email) lead = await searchLeadByEmail(email);
-    if (!lead && digitsOnly(phoneDigits)) lead = await searchLeadByPhone(phoneDigits);
+    if (!lead && phoneE164) lead = await searchLeadByPhoneE164(phoneE164);
 
-    const payload = mapCompleteToLead(submission);
+    const payload = mapCompleteToZohoLead(submission);
+
     if (lead?.id) await updateLead(lead.id, payload);
     else await createLead(payload);
 
