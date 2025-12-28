@@ -10,36 +10,21 @@ app.use(express.json({ limit: "1mb" }));
 /**
  * HIPAA best practices:
  * - Restrict CORS to known production origins
- * - Allow Lovable preview ONLY in non-production
  * - Do not log request bodies (PHI)
  */
-const PROD_ORIGINS = [
+const ALLOWED_ORIGINS = [
   "https://eligibility.himplant.com",
   "https://himplant.com",
   "https://www.himplant.com",
 ];
 
-// If Lovable uses a different preview domain, add it here (keep this permissive only in dev)
-function isLovablePreviewOrigin(origin) {
-  if (!origin) return false;
-  const o = String(origin).toLowerCase();
-  return o.endsWith(".lovable.app") || o.endsWith(".lovable.dev") || o.includes("lovable");
-}
-
 app.use(
   cors({
     origin: function (origin, callback) {
-      // Allow no-origin (curl, postman, server-to-server)
+      // Allow no-origin (e.g., curl/postman)
       if (!origin) return callback(null, true);
-
-      // Always allow production origins
-      if (PROD_ORIGINS.includes(origin)) return callback(null, true);
-
-      // Allow Lovable preview ONLY when not in production
-      const isProd = process.env.NODE_ENV === "production";
-      if (!isProd && isLovablePreviewOrigin(origin)) return callback(null, true);
-
-      return callback(new Error(`Not allowed by CORS: ${origin}`));
+      if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+      return callback(new Error("Not allowed by CORS"));
     },
     methods: ["GET", "POST", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
@@ -89,14 +74,6 @@ function pruneEmpty(obj) {
   return out;
 }
 
-function safeJoinArray(arr) {
-  if (!Array.isArray(arr)) return "";
-  return arr
-    .map((x) => String(x || "").trim())
-    .filter(Boolean)
-    .join(", ");
-}
-
 function nullableText(v) {
   if (v === undefined || v === null) return null;
   const s = String(v).trim();
@@ -104,14 +81,12 @@ function nullableText(v) {
 }
 
 /**
- * Zoho sometimes configures “boolean-looking” fields as TEXT or PICKLIST.
- * Convert booleans/text-boolean-ish values to Yes/No strings.
+ * Convert booleans (or "true"/"false") to Yes/No strings.
+ * Useful when Zoho fields are configured as Text or Picklist.
  */
 function boolToYesNo(v) {
   if (v === true) return "Yes";
   if (v === false) return "No";
-
-  // Handle frontend that might already send "Yes"/"No"
   if (typeof v === "string") {
     const s = v.trim().toLowerCase();
     if (s === "yes") return "Yes";
@@ -119,13 +94,11 @@ function boolToYesNo(v) {
     if (s === "true") return "Yes";
     if (s === "false") return "No";
   }
-
   return null;
 }
 
 /**
- * ✅ Zoho jsonarray helper
- * Zoho jsonarray fields require a REAL array, not a comma string or JSON string.
+ * Zoho "jsonarray" fields MUST be a real array of strings.
  * Handles:
  * - array: ["HPV","HIV/AIDS"]
  * - JSON string: '["HPV","HIV/AIDS"]'
@@ -134,12 +107,16 @@ function boolToYesNo(v) {
 function toZohoJsonArray(value) {
   if (value === undefined || value === null) return null;
 
-  // If frontend sends string, it may be JSON or CSV
+  if (Array.isArray(value)) {
+    const clean = value.map((x) => String(x || "").trim()).filter(Boolean);
+    return clean.length ? clean : null;
+  }
+
   if (typeof value === "string") {
     const s = value.trim();
     if (!s) return null;
 
-    // Try JSON array string first
+    // Try JSON array string
     if (s.startsWith("[") && s.endsWith("]")) {
       try {
         const parsed = JSON.parse(s);
@@ -152,20 +129,34 @@ function toZohoJsonArray(value) {
       }
     }
 
-    // Fall back to comma-splitting
+    // Comma-separated string fallback
     const parts = s.split(",").map((x) => x.trim()).filter(Boolean);
     return parts.length ? parts : null;
   }
 
-  // If frontend sends array already
-  if (Array.isArray(value)) {
-    const clean = value.map((x) => String(x || "").trim()).filter(Boolean);
-    return clean.length ? clean : null;
-  }
-
-  // Fallback
   const s = String(value).trim();
   return s ? [s] : null;
+}
+
+/**
+ * Multiline text helper (Zoho multiline field).
+ * If array -> newline separated.
+ */
+function toMultilineText(value) {
+  if (value === undefined || value === null) return null;
+
+  if (typeof value === "string") {
+    const s = value.trim();
+    return s ? s : null;
+  }
+
+  if (Array.isArray(value)) {
+    const lines = value.map((x) => String(x || "").trim()).filter(Boolean);
+    return lines.length ? lines.join("\n") : null;
+  }
+
+  const s = String(value).trim();
+  return s ? s : null;
 }
 
 /**
@@ -206,7 +197,9 @@ function normalizePhoneE164(countryCodeOrDial, phoneNumber) {
   const pn = digitsOnly(raw);
   const ccRaw = String(countryCodeOrDial || "").trim().toUpperCase();
 
-  const dial = ISO_TO_DIAL[ccRaw] || (digitsOnly(ccRaw) ? digitsOnly(ccRaw) : "");
+  const dial =
+    ISO_TO_DIAL[ccRaw] ||
+    (digitsOnly(ccRaw) ? digitsOnly(ccRaw) : "");
 
   if (!dial && !pn) return "";
   if (!dial) return pn ? `+${pn}` : "";
@@ -318,7 +311,7 @@ app.get("/api/geo/countries", async (req, res) => {
       if (c) countries.add(c);
     }
     res.json(Array.from(countries).sort((a, b) => a.localeCompare(b)));
-  } catch (e) {
+  } catch {
     res.status(500).json({ error: "countries lookup failed" });
   }
 });
@@ -343,7 +336,7 @@ app.get("/api/geo/states", async (req, res) => {
       if (st) states.add(st);
     }
     res.json(Array.from(states).sort((a, b) => a.localeCompare(b)));
-  } catch (e) {
+  } catch {
     res.status(500).json({ error: "states lookup failed" });
   }
 });
@@ -359,7 +352,8 @@ app.get("/api/geo/cities", async (req, res) => {
 
     let criteria = `(${FIELD_ACTIVE}:equals:true) and (${FIELD_COUNTRY}:equals:${country})`;
     if (country === "United States" && state) {
-      criteria = `(${FIELD_ACTIVE}:equals:true) and (${FIELD_COUNTRY}:equals:${country}) and (${FIELD_STATE}:equals:${state})`;
+      criteria =
+        `(${FIELD_ACTIVE}:equals:true) and (${FIELD_COUNTRY}:equals:${country}) and (${FIELD_STATE}:equals:${state})`;
     }
 
     const data = await zohoGET(
@@ -372,7 +366,7 @@ app.get("/api/geo/cities", async (req, res) => {
       if (city) cities.add(city);
     }
     res.json(Array.from(cities).sort((a, b) => a.localeCompare(b)));
-  } catch (e) {
+  } catch {
     res.status(500).json({ error: "cities lookup failed" });
   }
 });
@@ -390,7 +384,8 @@ app.get("/api/surgeons", async (req, res) => {
     if (!country) return res.status(400).json({ error: "country is required" });
     if (!city) return res.status(400).json({ error: "city is required" });
 
-    let criteria = `(${FIELD_ACTIVE}:equals:true) and (${FIELD_COUNTRY}:equals:${country}) and (${FIELD_CITY}:equals:${city})`;
+    let criteria =
+      `(${FIELD_ACTIVE}:equals:true) and (${FIELD_COUNTRY}:equals:${country}) and (${FIELD_CITY}:equals:${city})`;
     if (country === "United States" && state) {
       criteria =
         `(${FIELD_ACTIVE}:equals:true) and (${FIELD_COUNTRY}:equals:${country}) and ` +
@@ -413,7 +408,7 @@ app.get("/api/surgeons", async (req, res) => {
     });
 
     res.json(surgeons);
-  } catch (e) {
+  } catch {
     res.status(500).json({ error: "surgeons lookup failed" });
   }
 });
@@ -439,7 +434,7 @@ app.get("/api/surgeons/:id", async (req, res) => {
       price: s[FIELD_PRICE] ?? null,
       bookingUrl: bookingUrl || null,
     });
-  } catch (e) {
+  } catch {
     res.status(500).json({ error: "surgeon lookup failed" });
   }
 });
@@ -487,8 +482,7 @@ async function createLead(payload) {
 async function updateLead(leadId, payload) {
   const resp = await zohoPUT(`/crm/v2/${MODULE_LEADS}/${leadId}`, { data: [payload] });
   const status = resp?.data?.[0]?.status;
-  if (status !== "success")
-    throw new Error(`updateLead failed: ${JSON.stringify(resp?.data?.[0] || {})}`);
+  if (status !== "success") throw new Error(`updateLead failed: ${JSON.stringify(resp?.data?.[0] || {})}`);
   return true;
 }
 
@@ -541,6 +535,7 @@ function mapCompleteToZohoLead(submission) {
   const phone = normalizePhoneE164(submission.phone_country_code, submission.phone_number);
 
   return pruneEmpty({
+    // Identity
     First_Name: nullableText(submission.first_name),
     Last_Name: nullableText(submission.last_name),
     Email: nullableText(submission.email),
@@ -548,40 +543,44 @@ function mapCompleteToZohoLead(submission) {
     Mobile: phone || null,
     Date_of_Birth: nullableText(submission.date_of_birth),
 
+    // Location
     Country: nullableText(getCurrentCountry(submission)),
     State: nullableText(getCurrentState(submission)),
 
+    // Linker
     Session_ID: nullableText(submission.session_id),
 
+    // Lookup
     Surgeon_name_Lookup: nullableText(submission.surgeon_id),
 
+    // Intake fields
     Payment_Method: nullableText(submission.payment_method),
     Procedure_Timeline: nullableText(submission.timeline),
 
+    // boolean-looking fields (Zoho text/picklist safe)
     Circumcised: boolToYesNo(submission.circumcised),
     Tobacco: boolToYesNo(submission.tobacco_use),
     ED_history: boolToYesNo(submission.ed_history),
     Active_STD: boolToYesNo(submission.active_std),
 
     Can_maintain_erection:
-      submission.ed_maintain_with_or_without_meds === null ||
-      submission.ed_maintain_with_or_without_meds === undefined
+      submission.ed_maintain_with_or_without_meds === null || submission.ed_maintain_with_or_without_meds === undefined
         ? null
         : boolToYesNo(submission.ed_maintain_with_or_without_meds),
 
-    // ✅ FIX: Zoho expects jsonarray here
+    // ✅ jsonarray fields
     STD_list: toZohoJsonArray(submission.std_list),
+    Previous_Penis_Surgeries: toZohoJsonArray(submission.prior_procedure_list),
 
     Recent_Outbreak:
       submission.recent_outbreak_6mo === null || submission.recent_outbreak_6mo === undefined
         ? null
         : boolToYesNo(submission.recent_outbreak_6mo),
 
-    Previous_Penis_Surgeries: safeJoinArray(submission.prior_procedure_list),
+    // Multiline text field
+    Medical_conditions_list: toMultilineText(submission.medical_conditions_list),
 
-    Medical_conditions_list: safeJoinArray(submission.medical_conditions_list),
     Body_Type: nullableText(submission.body_type),
-
     Outcome: nullableText(submission.outcome),
 
     Intake_Date: nullableText(submission.submitted_at) || new Date().toISOString(),
@@ -590,6 +589,9 @@ function mapCompleteToZohoLead(submission) {
 
 // -------------------------
 // Submissions endpoint
+// - lead: create/update by Email -> Phone; always set Session_ID
+// - partial: create/update by Email -> Phone
+// - complete: update by Session_ID -> Email -> Phone; if matched by email/phone, bind Session_ID
 // -------------------------
 app.post("/api/submissions", async (req, res) => {
   try {
@@ -607,11 +609,9 @@ app.post("/api/submissions", async (req, res) => {
     const email = String(submission.email || "").trim();
     const phoneE164 = normalizePhoneE164(submission.phone_country_code, submission.phone_number);
 
+    // Validate minimal identifiers
     if ((type === "lead" || type === "complete") && !sessionId) {
-      return res.status(400).json({
-        success: false,
-        error: `${type} submission requires session_id.`,
-      });
+      return res.status(400).json({ success: false, error: `${type} submission requires session_id.` });
     }
 
     if (!sessionId && !email && !phoneE164) {
@@ -644,6 +644,7 @@ app.post("/api/submissions", async (req, res) => {
       return res.json({ success: true });
     }
 
+    // COMPLETE: Session_ID -> Email -> Phone
     let lead = null;
     if (sessionId) lead = await searchLeadBySessionId(sessionId);
     if (!lead && email) lead = await searchLeadByEmail(email);
@@ -651,9 +652,8 @@ app.post("/api/submissions", async (req, res) => {
 
     const payload = mapCompleteToZohoLead(submission);
 
-    if (lead?.id && sessionId) {
-      payload.Session_ID = sessionId;
-    }
+    // Bind new session to existing lead if we matched by email/phone
+    if (lead?.id && sessionId) payload.Session_ID = sessionId;
 
     if (lead?.id) await updateLead(lead.id, payload);
     else await createLead(payload);
