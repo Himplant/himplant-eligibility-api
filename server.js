@@ -4,14 +4,9 @@ import fetch from "node-fetch";
 
 const app = express();
 
-// Keep payload size reasonable (PHI safety + abuse protection)
+// Bigger limit so we don't randomly fail on size
 app.use(express.json({ limit: "5mb" }));
 
-/**
- * HIPAA best practices:
- * - Restrict CORS to known production origins
- * - Do not log request bodies (PHI)
- */
 const ALLOWED_ORIGINS = [
   "https://eligibility.himplant.com",
   "https://himplant.com",
@@ -21,7 +16,6 @@ const ALLOWED_ORIGINS = [
 app.use(
   cors({
     origin: function (origin, callback) {
-      // Allow no-origin (e.g., curl/postman)
       if (!origin) return callback(null, true);
       if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
       return callback(new Error("Not allowed by CORS"));
@@ -31,27 +25,22 @@ app.use(
   })
 );
 
-// Zoho US endpoints
 const ZOHO_ACCOUNTS = "https://accounts.zoho.com";
 const ZOHO_API_BASE = "https://www.zohoapis.com";
 
-// Env
 const {
   ZOHO_CLIENT_ID,
   ZOHO_CLIENT_SECRET,
   ZOHO_REFRESH_TOKEN,
   CREATE_ZOHO_ERROR_TASKS,
+  DEBUG_ZOHO,
 } = process.env;
 
-// Modules
 const MODULE_SURGEONS = "Surgeons";
 const MODULE_LEADS = "Leads";
 const MODULE_TASKS = "Tasks";
 
-// Leads multiline field to store payload history
 const FIELD_QUESTIONNAIRE_DETAILS = "Questionnaire_Details";
-
-// Max chars to keep in Questionnaire_Details
 const QUESTIONNAIRE_DETAILS_MAX_CHARS = 28000;
 
 // Surgeons fields (Zoho API names)
@@ -65,13 +54,16 @@ const FIELD_BOOK_EN = "Consult_Booking_EN";
 const FIELD_BOOK_ES = "Consult_Booking_ES";
 const FIELD_BOOK_AR = "Consult_Booking_AR";
 
-// Access token cache
+// token cache
 let cachedAccessToken = null;
 let tokenExpiresAt = 0;
 
-// -------------------------
-// Helpers (PHI-safe)
-// -------------------------
+const DEBUG = String(DEBUG_ZOHO || "").toLowerCase() === "true";
+
+function debugLog(...args) {
+  if (DEBUG) console.log(...args);
+}
+
 function digitsOnly(s) {
   return String(s || "").replace(/\D/g, "");
 }
@@ -105,9 +97,6 @@ function boolToYesNo(v) {
   return null;
 }
 
-/**
- * Zoho "jsonarray" fields MUST be a real array of strings.
- */
 function toZohoJsonArray(value) {
   if (value === undefined || value === null) return null;
 
@@ -120,7 +109,6 @@ function toZohoJsonArray(value) {
     const s = value.trim();
     if (!s) return null;
 
-    // Try JSON array string
     if (s.startsWith("[") && s.endsWith("]")) {
       try {
         const parsed = JSON.parse(s);
@@ -128,12 +116,9 @@ function toZohoJsonArray(value) {
           const clean = parsed.map((x) => String(x || "").trim()).filter(Boolean);
           return clean.length ? clean : null;
         }
-      } catch {
-        // fall through
-      }
+      } catch {}
     }
 
-    // Comma-separated fallback
     const parts = s.split(",").map((x) => x.trim()).filter(Boolean);
     return parts.length ? parts : null;
   }
@@ -142,10 +127,6 @@ function toZohoJsonArray(value) {
   return s ? [s] : null;
 }
 
-/**
- * Multiline text helper (Zoho multiline field).
- * If array -> newline separated.
- */
 function toMultilineText(value) {
   if (value === undefined || value === null) return null;
 
@@ -163,9 +144,6 @@ function toMultilineText(value) {
   return s ? s : null;
 }
 
-/**
- * Phone normalization to E.164: +<countrycode><number> (no spaces)
- */
 const ISO_TO_DIAL = {
   US: "1",
   CA: "1",
@@ -249,12 +227,12 @@ function safeJsonStringify(obj, maxLen = 28000) {
 }
 
 function shouldCreateErrorTasks() {
-  if (CREATE_ZOHO_ERROR_TASKS === undefined) return true; // default ON
+  if (CREATE_ZOHO_ERROR_TASKS === undefined) return true;
   return String(CREATE_ZOHO_ERROR_TASKS).toLowerCase() === "true";
 }
 
 // -------------------------
-// Zoho Auth + Requests
+// Zoho auth + requests
 // -------------------------
 async function getAccessToken() {
   const now = Date.now();
@@ -318,7 +296,7 @@ const zohoPOST = (path, body) => zohoRequest("POST", path, body);
 const zohoPUT = (path, body) => zohoRequest("PUT", path, body);
 
 // -------------------------
-// Zoho Tasks on errors (Subject + Status required)
+// Error Task
 // -------------------------
 async function createZohoErrorTask({
   leadId,
@@ -368,7 +346,7 @@ async function createZohoErrorTask({
 app.get("/health", (req, res) => res.json({ ok: true }));
 
 // -------------------------
-// CMS endpoints (unchanged)
+// Surgeons endpoints
 // -------------------------
 app.get("/api/geo/countries", async (req, res) => {
   try {
@@ -534,52 +512,7 @@ async function searchLeadByPhoneE164(phoneE164) {
 
 async function getLeadByIdForAppend(leadId) {
   const record = await zohoGET(`/crm/v2/${MODULE_LEADS}/${leadId}`);
-  const lead = record?.data?.[0] || null;
-  return lead;
-}
-
-async function createLead(payload) {
-  const resp = await zohoPOST(`/crm/v2/${MODULE_LEADS}`, { data: [payload] });
-  const first = resp?.data?.[0];
-
-  if (first?.status !== "success") {
-    const err = new Error("createLead failed");
-    err.zoho = first || resp;
-
-    // IMPORTANT: Zoho can return HTTP 200 with status:error inside the body.
-    // Treat as non-retryable validation/mapping failure.
-    err.httpStatus = 400;
-
-    throw err;
-  }
-
-  const id = first?.details?.id;
-  if (!id) {
-    const err = new Error("createLead failed (no id returned)");
-    err.zoho = first || resp;
-    err.httpStatus = 400;
-    throw err;
-  }
-
-  return id;
-}
-
-async function updateLead(leadId, payload) {
-  const resp = await zohoPUT(`/crm/v2/${MODULE_LEADS}/${leadId}`, { data: [payload] });
-  const first = resp?.data?.[0];
-
-  if (first?.status !== "success") {
-    const err = new Error("updateLead failed");
-    err.zoho = first || resp;
-
-    // IMPORTANT: Zoho can return HTTP 200 with status:error inside the body.
-    // Treat as non-retryable validation/mapping failure.
-    err.httpStatus = 400;
-
-    throw err;
-  }
-
-  return true;
+  return record?.data?.[0] || null;
 }
 
 // -------------------------
@@ -630,7 +563,80 @@ async function attachAppendedQuestionnaireDetails(leadIdOrNull, payload, submiss
 }
 
 // -------------------------
-// Duplicate phone safe retry
+// Zoho mapping
+// -------------------------
+function mapLeadBase(submission) {
+  const phone = normalizePhoneE164(submission.phone_country_code, submission.phone_number);
+  return pruneEmpty({
+    First_Name: nullableText(submission.first_name),
+    Last_Name: nullableText(submission.last_name),
+    Email: nullableText(submission.email),
+    Phone: phone || null,
+    Mobile: phone || null,
+    Country: nullableText(getCurrentCountry(submission)),
+    State: nullableText(getCurrentState(submission)),
+    Session_ID: nullableText(submission.session_id),
+    Surgeon_name_Lookup: nullableText(submission.surgeon_id),
+    Intake_Date: nullableText(submission.submitted_at) || new Date().toISOString(),
+  });
+}
+
+function mapPartialBase(submission) {
+  const phone = normalizePhoneE164(submission.phone_country_code, submission.phone_number);
+  return pruneEmpty({
+    First_Name: nullableText(submission.first_name),
+    Last_Name: nullableText(submission.last_name),
+    Email: nullableText(submission.email),
+    Phone: phone || null,
+    Mobile: phone || null,
+    Country: nullableText(getCurrentCountry(submission)),
+    State: nullableText(getCurrentState(submission)),
+    Session_ID: nullableText(submission.session_id),
+    Date_of_Birth: nullableText(submission.date_of_birth),
+    Intake_Date: nullableText(submission.submitted_at) || new Date().toISOString(),
+  });
+}
+
+function mapCompleteBase(submission) {
+  const phone = normalizePhoneE164(submission.phone_country_code, submission.phone_number);
+  return pruneEmpty({
+    First_Name: nullableText(submission.first_name),
+    Last_Name: nullableText(submission.last_name),
+    Email: nullableText(submission.email),
+    Phone: phone || null,
+    Mobile: phone || null,
+    Date_of_Birth: nullableText(submission.date_of_birth),
+    Country: nullableText(getCurrentCountry(submission)),
+    State: nullableText(getCurrentState(submission)),
+    Session_ID: nullableText(submission.session_id),
+    Surgeon_name_Lookup: nullableText(submission.surgeon_id),
+    Payment_Method: nullableText(submission.payment_method),
+    Procedure_Timeline: nullableText(submission.timeline),
+    Circumcised: boolToYesNo(submission.circumcised),
+    Tobacco: boolToYesNo(submission.tobacco_use),
+    ED_history: boolToYesNo(submission.ed_history),
+    Active_STD: boolToYesNo(submission.active_std),
+    Can_maintain_erection:
+      submission.ed_maintain_with_or_without_meds === null ||
+      submission.ed_maintain_with_or_without_meds === undefined
+        ? null
+        : boolToYesNo(submission.ed_maintain_with_or_without_meds),
+    STD_list: toZohoJsonArray(submission.std_list),
+    Previous_Penis_Surgeries: toZohoJsonArray(submission.prior_procedure_list),
+    Recent_Outbreak:
+      submission.recent_outbreak_6mo === null ||
+      submission.recent_outbreak_6mo === undefined
+        ? null
+        : boolToYesNo(submission.recent_outbreak_6mo),
+    Medical_conditions_list: toMultilineText(submission.medical_conditions_list),
+    Body_Type: nullableText(submission.body_type),
+    Outcome: nullableText(submission.outcome),
+    Intake_Date: nullableText(submission.submitted_at) || new Date().toISOString(),
+  });
+}
+
+// -------------------------
+// Zoho errors + recovery
 // -------------------------
 function stripPhoneFields(payload) {
   const { Phone, Mobile, ...rest } = payload || {};
@@ -643,97 +649,107 @@ function isDuplicatePhoneZohoError(zohoErr) {
   return code === "DUPLICATE_DATA" && (api === "Phone" || api === "Mobile");
 }
 
-// -------------------------
-// Mapping to Zoho Leads API names
-// -------------------------
-function mapLeadBase(submission) {
-  const phone = normalizePhoneE164(submission.phone_country_code, submission.phone_number);
-
-  return pruneEmpty({
-    First_Name: nullableText(submission.first_name),
-    Last_Name: nullableText(submission.last_name),
-    Email: nullableText(submission.email),
-
-    Phone: phone || null,
-    Mobile: phone || null,
-
-    Country: nullableText(getCurrentCountry(submission)),
-    State: nullableText(getCurrentState(submission)),
-
-    Session_ID: nullableText(submission.session_id),
-    Surgeon_name_Lookup: nullableText(submission.surgeon_id),
-
-    Intake_Date: nullableText(submission.submitted_at) || new Date().toISOString(),
-  });
+function getApiNameFromZohoErr(zohoErr) {
+  return zohoErr?.details?.api_name || null;
 }
 
-function mapPartialBase(submission) {
-  const phone = normalizePhoneE164(submission.phone_country_code, submission.phone_number);
-
-  return pruneEmpty({
-    First_Name: nullableText(submission.first_name),
-    Last_Name: nullableText(submission.last_name),
-    Email: nullableText(submission.email),
-
-    Phone: phone || null,
-    Mobile: phone || null,
-
-    Country: nullableText(getCurrentCountry(submission)),
-    State: nullableText(getCurrentState(submission)),
-
-    Session_ID: nullableText(submission.session_id),
-
-    Date_of_Birth: nullableText(submission.date_of_birth),
-    Intake_Date: nullableText(submission.submitted_at) || new Date().toISOString(),
-  });
+function isInvalidDataLike(zohoErr) {
+  const code = zohoErr?.code;
+  return code === "INVALID_DATA" || code === "MANDATORY_NOT_FOUND";
 }
 
-function mapCompleteBase(submission) {
-  const phone = normalizePhoneE164(submission.phone_country_code, submission.phone_number);
+// -------------------------
+// Zoho upsert
+// NOTE: Zoho can return HTTP 200 with data[0].status="error"
+// We treat those as httpStatus=400 so caller can react.
+// -------------------------
+async function getAccessTokenOrThrow() {
+  return await getAccessToken();
+}
 
-  return pruneEmpty({
-    First_Name: nullableText(submission.first_name),
-    Last_Name: nullableText(submission.last_name),
-    Email: nullableText(submission.email),
-    Phone: phone || null,
-    Mobile: phone || null,
-    Date_of_Birth: nullableText(submission.date_of_birth),
+async function createLead(payload) {
+  const resp = await zohoPOST(`/crm/v2/${MODULE_LEADS}`, { data: [payload] });
+  const first = resp?.data?.[0];
 
-    Country: nullableText(getCurrentCountry(submission)),
-    State: nullableText(getCurrentState(submission)),
+  if (first?.status !== "success") {
+    const err = new Error("createLead failed");
+    err.zoho = first || resp;
+    err.httpStatus = 400;
+    throw err;
+  }
 
-    Session_ID: nullableText(submission.session_id),
-    Surgeon_name_Lookup: nullableText(submission.surgeon_id),
+  const id = first?.details?.id;
+  if (!id) {
+    const err = new Error("createLead failed (no id returned)");
+    err.zoho = first || resp;
+    err.httpStatus = 400;
+    throw err;
+  }
+  return id;
+}
 
-    Payment_Method: nullableText(submission.payment_method),
-    Procedure_Timeline: nullableText(submission.timeline),
+async function updateLeadOnce(leadId, payload) {
+  const resp = await zohoPUT(`/crm/v2/${MODULE_LEADS}/${leadId}`, { data: [payload] });
+  const first = resp?.data?.[0];
 
-    Circumcised: boolToYesNo(submission.circumcised),
-    Tobacco: boolToYesNo(submission.tobacco_use),
-    ED_history: boolToYesNo(submission.ed_history),
-    Active_STD: boolToYesNo(submission.active_std),
+  if (first?.status !== "success") {
+    const err = new Error("updateLead failed");
+    err.zoho = first || resp;
+    err.httpStatus = 400;
+    throw err;
+  }
+  return { ok: true, resp };
+}
 
-    Can_maintain_erection:
-      submission.ed_maintain_with_or_without_meds === null ||
-      submission.ed_maintain_with_or_without_meds === undefined
-        ? null
-        : boolToYesNo(submission.ed_maintain_with_or_without_meds),
+/**
+ * Auto-fix loop:
+ * - if Zoho says field X is invalid, remove X and retry (keeps Questionnaire_Details)
+ * - returns list of removed fields so we can permanently fix mapping next
+ */
+async function updateLeadWithAutoFix(leadId, payload) {
+  let working = { ...payload };
+  const removed = [];
 
-    STD_list: toZohoJsonArray(submission.std_list),
-    Previous_Penis_Surgeries: toZohoJsonArray(submission.prior_procedure_list),
+  for (let attempt = 1; attempt <= 8; attempt++) {
+    try {
+      const out = await updateLeadOnce(leadId, working);
+      return { success: true, removedFields: removed, zohoResponse: out.resp };
+    } catch (e) {
+      const zohoErr = e?.zoho || null;
 
-    Recent_Outbreak:
-      submission.recent_outbreak_6mo === null || submission.recent_outbreak_6mo === undefined
-        ? null
-        : boolToYesNo(submission.recent_outbreak_6mo),
+      if (isDuplicatePhoneZohoError(zohoErr)) {
+        working = stripPhoneFields(working);
+        removed.push("Phone");
+        removed.push("Mobile");
+        continue;
+      }
 
-    Medical_conditions_list: toMultilineText(submission.medical_conditions_list),
+      if (isInvalidDataLike(zohoErr)) {
+        const apiName = getApiNameFromZohoErr(zohoErr);
+        if (apiName && Object.prototype.hasOwnProperty.call(working, apiName)) {
+          debugLog(`[Zoho reject] removing field ${apiName} and retrying...`);
+          delete working[apiName];
+          removed.push(apiName);
+          continue;
+        }
+      }
 
-    Body_Type: nullableText(submission.body_type),
-    Outcome: nullableText(submission.outcome),
+      throw e;
+    }
+  }
 
-    Intake_Date: nullableText(submission.submitted_at) || new Date().toISOString(),
-  });
+  const err = new Error("updateLead failed after retries");
+  err.httpStatus = 500;
+  throw err;
+}
+
+// -------------------------
+// Zoho task creation toggle
+// -------------------------
+async function createZohoErrorTaskSafe(args) {
+  try {
+    await createZohoErrorTask(args);
+  } catch {}
 }
 
 // -------------------------
@@ -748,6 +764,7 @@ app.post("/api/submissions", async (req, res) => {
   const phoneE164 = normalizePhoneE164(submission.phone_country_code, submission.phone_number);
 
   let lead = null;
+  let removedFields = [];
 
   try {
     if (!["lead", "partial", "complete"].includes(type)) {
@@ -765,12 +782,11 @@ app.post("/api/submissions", async (req, res) => {
       return res.status(400).json({ success: false, error: "Need session_id, email, or phone." });
     }
 
-    // Find existing lead
+    // Find lead
     if (type === "complete" && sessionId) lead = await searchLeadBySessionId(sessionId);
     if (!lead && email) lead = await searchLeadByEmail(email);
     if (!lead && phoneE164) lead = await searchLeadByPhoneE164(phoneE164);
 
-    // Base payload
     let payloadBase =
       type === "lead"
         ? mapLeadBase(submission)
@@ -778,10 +794,8 @@ app.post("/api/submissions", async (req, res) => {
           ? mapPartialBase(submission)
           : mapCompleteBase(submission);
 
-    // If complete and matched by email/phone, bind session id
     if (type === "complete" && lead?.id && sessionId) payloadBase.Session_ID = sessionId;
 
-    // Append Questionnaire_Details
     let payload = await attachAppendedQuestionnaireDetails(
       lead?.id || null,
       payloadBase,
@@ -790,44 +804,24 @@ app.post("/api/submissions", async (req, res) => {
       { sessionId, email, phone: phoneE164 }
     );
 
-    // Upsert
     if (lead?.id) {
-      try {
-        await updateLead(lead.id, payload);
-      } catch (e) {
-        const zohoErr = e?.zoho || null;
-
-        // Duplicate phone: retry update without phone fields
-        if (isDuplicatePhoneZohoError(zohoErr)) {
-          await updateLead(lead.id, stripPhoneFields(payload));
-
-          await createZohoErrorTask({
-            leadId: lead.id,
-            submissionType: type,
-            sessionId,
-            email,
-            phoneE164,
-            errorMessage: "Duplicate phone detected; updated lead without Phone/Mobile. Manual review needed.",
-            zohoDetails: zohoErr,
-            submissionPayload: submission,
-          });
-
-          return res.json({ success: true, warning: "updated_without_phone_due_to_duplicate" });
-        }
-
-        throw e;
-      }
+      const upd = await updateLeadWithAutoFix(lead.id, payload);
+      removedFields = upd.removedFields || [];
     } else {
       const newId = await createLead(payload);
       lead = { id: newId };
     }
 
-    return res.json({ success: true });
+    // Return success; include removed fields for debugging in browser
+    return res.json({
+      success: true,
+      removed_fields: removedFields,
+    });
   } catch (e) {
     const zohoErr = e?.zoho || null;
     const zohoHttp = e?.httpStatus || null;
 
-    await createZohoErrorTask({
+    await createZohoErrorTaskSafe({
       leadId: lead?.id || null,
       submissionType: type,
       sessionId,
@@ -838,28 +832,35 @@ app.post("/api/submissions", async (req, res) => {
       submissionPayload: submission,
     });
 
-    // PHI-safe server log (no req.body)
     console.error(
       "[POST /api/submissions] error:",
       String(e?.message || e),
-      zohoHttp ? `(zoho_http=${zohoHttp})` : ""
+      zohoHttp ? `(zoho_http=${zohoHttp})` : "",
+      zohoErr?.code ? `(zoho_code=${zohoErr.code})` : "",
+      zohoErr?.details?.api_name ? `(api_name=${zohoErr.details.api_name})` : ""
     );
 
-    // Zoho 4xx (or body-status errors we mark as 400) = validation/mapping issue; retry won't fix it.
-    const isNonRetryableZohoError = zohoHttp && zohoHttp >= 400 && zohoHttp < 500;
+    // For Zoho 4xx, return 200 so the client isn't blocked.
+    const nonRetryable = zohoHttp && zohoHttp >= 400 && zohoHttp < 500;
 
-    if (isNonRetryableZohoError) {
+    if (nonRetryable) {
       return res.status(200).json({
         success: true,
         warning: "zoho_rejected_payload_manual_review_needed",
         zoho_http: zohoHttp,
         zoho_code: zohoErr?.code || null,
         zoho_api_name: zohoErr?.details?.api_name || null,
+        zoho_message: zohoErr?.message || null,
+        // include full zoho error body ONLY in debug mode
+        zoho_debug: DEBUG ? zohoErr : undefined,
       });
     }
 
-    // 5xx/unknown errors should remain 500 so outbox retries later
-    return res.status(500).json({ success: false, error: "submission failed" });
+    return res.status(500).json({
+      success: false,
+      error: "submission failed",
+      zoho_debug: DEBUG ? zohoErr : undefined,
+    });
   }
 });
 
