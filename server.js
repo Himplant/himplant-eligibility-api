@@ -43,7 +43,7 @@ const MODULE_TASKS = "Tasks";
 
 const FIELD_QUESTIONNAIRE_DETAILS = "Questionnaire_Details";
 
-// Keep this a bit smaller so Zoho rejects it less often
+// Keep this smaller to reduce Zoho rejecting it
 const QUESTIONNAIRE_DETAILS_MAX_CHARS = 20000;
 
 // Surgeons fields (Zoho API names)
@@ -232,6 +232,9 @@ function shouldCreateErrorTasks() {
   return String(CREATE_ZOHO_ERROR_TASKS).toLowerCase() === "true";
 }
 
+// ✅ Force Zoho automations to run
+const ZOHO_TRIGGER = ["workflow", "blueprint"];
+
 // -------------------------
 // Zoho auth + requests
 // -------------------------
@@ -298,7 +301,7 @@ const zohoPOST = (path, body) => zohoRequest("POST", path, body);
 const zohoPUT = (path, body) => zohoRequest("PUT", path, body);
 
 // -------------------------
-// Error Task
+// Error Task (also triggers workflows/blueprints)
 // -------------------------
 async function createZohoErrorTask({
   leadId,
@@ -336,7 +339,10 @@ async function createZohoErrorTask({
   });
 
   try {
-    await zohoPOST(`/crm/v2/${MODULE_TASKS}`, { data: [taskRecord] });
+    await zohoPOST(`/crm/v2/${MODULE_TASKS}`, {
+      trigger: ZOHO_TRIGGER,
+      data: [taskRecord],
+    });
   } catch (e) {
     console.error("[Zoho Task] failed:", String(e.message || e));
   }
@@ -517,11 +523,6 @@ async function getLeadByIdForAppend(leadId) {
   return record?.data?.[0] || null;
 }
 
-/**
- * IMPORTANT: matching order you requested:
- * Email -> Phone -> Session_ID
- * Returns { lead, matchedBy } where matchedBy is "email" | "phone" | "session" | "none"
- */
 async function findLeadByPriority({ email, phoneE164, sessionId }) {
   if (email) {
     const byEmail = await searchLeadByEmail(email);
@@ -559,10 +560,6 @@ function clampToMaxCharsKeepNewest(text, maxChars) {
   return "[TRUNCATED_OLD_ENTRIES]\n\n" + s.slice(s.length - maxChars);
 }
 
-/**
- * Only appends when lead exists.
- * If no lead exists, caller decides whether to create a new lead (with Questionnaire_Details set).
- */
 async function appendQuestionnaireDetailsToExistingLead(leadId, payload, submission, type, ctx) {
   const newEntry = buildEntryString(submission, type, ctx);
 
@@ -652,8 +649,7 @@ function mapCompleteBase(submission) {
     Previous_Penis_Surgeries: toZohoJsonArray(submission.prior_procedure_list),
 
     Recent_Outbreak:
-      submission.recent_outbreak_6mo === null ||
-      submission.recent_outbreak_6mo === undefined
+      submission.recent_outbreak_6mo === null || submission.recent_outbreak_6mo === undefined
         ? null
         : boolToYesNo(submission.recent_outbreak_6mo),
 
@@ -693,12 +689,13 @@ function getApiNameFromZohoErr(zohoErr) {
 }
 
 // -------------------------
-// Zoho upsert
-// NOTE: Zoho may return HTTP 200 with data[0].status="error"
-// We treat those as httpStatus=400
+// Zoho upsert (with triggers)
 // -------------------------
 async function createLead(payload) {
-  const resp = await zohoPOST(`/crm/v2/${MODULE_LEADS}`, { data: [payload] });
+  const resp = await zohoPOST(`/crm/v2/${MODULE_LEADS}`, {
+    trigger: ZOHO_TRIGGER,
+    data: [payload],
+  });
   const first = resp?.data?.[0];
 
   if (first?.status !== "success") {
@@ -719,7 +716,10 @@ async function createLead(payload) {
 }
 
 async function updateLeadOnce(leadId, payload) {
-  const resp = await zohoPUT(`/crm/v2/${MODULE_LEADS}/${leadId}`, { data: [payload] });
+  const resp = await zohoPUT(`/crm/v2/${MODULE_LEADS}/${leadId}`, {
+    trigger: ZOHO_TRIGGER,
+    data: [payload],
+  });
   const first = resp?.data?.[0];
 
   if (first?.status !== "success") {
@@ -732,14 +732,6 @@ async function updateLeadOnce(leadId, payload) {
   return true;
 }
 
-/**
- * Recovery loop:
- * - DUPLICATE Email -> remove Email and retry
- * - DUPLICATE Phone/Mobile -> remove Phone/Mobile and retry
- * - INVALID_DATA <api_name> -> remove that field and retry
- *
- * Returns removed_fields so you can see what Zoho rejected.
- */
 async function updateLeadWithRecovery(leadId, payload) {
   let working = { ...payload };
   const removed = [];
@@ -809,21 +801,14 @@ app.post("/api/submissions", async (req, res) => {
       });
     }
 
-    if ((type === "lead" || type === "complete") && !sessionId) {
-      // You can loosen this if you want, but leaving as-is for now.
-      return res.status(400).json({ success: false, error: `${type} submission requires session_id.` });
-    }
-
     if (!sessionId && !email && !phoneE164) {
       return res.status(400).json({ success: false, error: "Need session_id, email, or phone." });
     }
 
-    // ✅ Your requested matching priority:
     const found = await findLeadByPriority({ email, phoneE164, sessionId });
     lead = found.lead;
     matchedBy = found.matchedBy;
 
-    // Build payload base
     let payloadBase =
       type === "lead"
         ? mapLeadBase(submission)
@@ -831,14 +816,7 @@ app.post("/api/submissions", async (req, res) => {
           ? mapPartialBase(submission)
           : mapCompleteBase(submission);
 
-    // If we matched an existing lead:
     if (lead?.id) {
-      // IMPORTANT: if we matched by email, don't try to overwrite phone if it causes duplicates (recovery handles it)
-      // If we matched by phone, don't try to overwrite email if it causes duplicates (recovery handles it)
-      // If we matched by session, we still DO NOT want to overwrite email/phone if those collide with other leads.
-      // Recovery handles it by stripping duplicates if Zoho complains.
-
-      // ✅ Only here do we append Questionnaire_Details (because lead exists)
       const payloadWithAppend = await appendQuestionnaireDetailsToExistingLead(
         lead.id,
         payloadBase,
@@ -849,7 +827,6 @@ app.post("/api/submissions", async (req, res) => {
 
       const upd = await updateLeadWithRecovery(lead.id, payloadWithAppend);
 
-      // If Zoho rejected Questionnaire_Details, create a task that keeps the full payload.
       if ((upd.removed_fields || []).includes(FIELD_QUESTIONNAIRE_DETAILS)) {
         await createZohoErrorTask({
           leadId: lead.id,
@@ -870,66 +847,15 @@ app.post("/api/submissions", async (req, res) => {
       });
     }
 
-    // If no lead exists: create new lead (so you still capture the user)
-    // For new lead, it’s okay to set Questionnaire_Details as initial value.
+    // No lead exists -> create one with initial Questionnaire_Details
     const initialEntry = buildEntryString(submission, type, { sessionId, email, phone: phoneE164 });
     const createPayload = {
       ...payloadBase,
       [FIELD_QUESTIONNAIRE_DETAILS]: clampToMaxCharsKeepNewest(initialEntry, QUESTIONNAIRE_DETAILS_MAX_CHARS),
     };
 
-    try {
-      const newId = await createLead(createPayload);
-      return res.json({ success: true, created: true, lead_id: newId });
-    } catch (e) {
-      // If create fails due to duplicate email/phone, re-find and update
-      const zohoErr = e?.zoho || null;
-
-      if (isDuplicateZohoErrorForField(zohoErr, "Email") && email) {
-        const byEmail = await searchLeadByEmail(email);
-        if (byEmail?.id) {
-          const payloadWithAppend = await appendQuestionnaireDetailsToExistingLead(
-            byEmail.id,
-            payloadBase,
-            submission,
-            type,
-            { sessionId, email, phone: phoneE164 }
-          );
-          const upd = await updateLeadWithRecovery(byEmail.id, payloadWithAppend);
-          return res.json({
-            success: true,
-            matched_by: "email",
-            warning: "create_duplicate_email_updated_existing",
-            removed_fields: upd.removed_fields || [],
-          });
-        }
-      }
-
-      if (
-        (isDuplicateZohoErrorForField(zohoErr, "Phone") || isDuplicateZohoErrorForField(zohoErr, "Mobile")) &&
-        phoneE164
-      ) {
-        const byPhone = await searchLeadByPhoneE164(phoneE164);
-        if (byPhone?.id) {
-          const payloadWithAppend = await appendQuestionnaireDetailsToExistingLead(
-            byPhone.id,
-            payloadBase,
-            submission,
-            type,
-            { sessionId, email, phone: phoneE164 }
-          );
-          const upd = await updateLeadWithRecovery(byPhone.id, payloadWithAppend);
-          return res.json({
-            success: true,
-            matched_by: "phone",
-            warning: "create_duplicate_phone_updated_existing",
-            removed_fields: upd.removed_fields || [],
-          });
-        }
-      }
-
-      throw e;
-    }
+    const newId = await createLead(createPayload);
+    return res.json({ success: true, created: true, lead_id: newId });
   } catch (e) {
     const zohoErr = e?.zoho || null;
     const zohoHttp = e?.httpStatus || null;
