@@ -5,7 +5,7 @@ import fetch from "node-fetch";
 const app = express();
 
 // Keep payload size reasonable (PHI safety + abuse protection)
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "5mb" })); // allow base64 PDF payloads; still controlled
 
 /**
  * HIPAA best practices:
@@ -51,8 +51,11 @@ const MODULE_TASKS = "Tasks";
 // Leads multiline field to store payload history
 const FIELD_QUESTIONNAIRE_DETAILS = "Questionnaire_Details";
 
-// Max chars to keep in Questionnaire_Details (Zoho multiline fields have limits; keep safely under typical caps)
+// Max chars to keep in Questionnaire_Details
 const QUESTIONNAIRE_DETAILS_MAX_CHARS = 28000;
+
+// Max attachment size for Zoho attachments is commonly 20MB; enforce conservative cap here
+const PDF_ATTACHMENT_MAX_BYTES = 18 * 1024 * 1024; // 18MB
 
 // Surgeons fields (Zoho API names)
 const FIELD_ACTIVE = "Active_Status";
@@ -120,7 +123,6 @@ function toZohoJsonArray(value) {
     const s = value.trim();
     if (!s) return null;
 
-    // Try JSON array string
     if (s.startsWith("[") && s.endsWith("]")) {
       try {
         const parsed = JSON.parse(s);
@@ -133,7 +135,6 @@ function toZohoJsonArray(value) {
       }
     }
 
-    // Comma-separated fallback
     const parts = s.split(",").map((x) => x.trim()).filter(Boolean);
     return parts.length ? parts : null;
   }
@@ -285,13 +286,14 @@ async function getAccessToken() {
   return cachedAccessToken;
 }
 
-async function zohoRequest(method, path, body) {
+async function zohoRequest(method, path, body, extraHeaders = {}) {
   const token = await getAccessToken();
   const res = await fetch(`${ZOHO_API_BASE}${path}`, {
     method,
     headers: {
       Authorization: `Zoho-oauthtoken ${token}`,
       ...(body ? { "Content-Type": "application/json" } : {}),
+      ...extraHeaders,
     },
     body: body ? JSON.stringify(body) : undefined,
   });
@@ -316,6 +318,76 @@ async function zohoRequest(method, path, body) {
 const zohoGET = (path) => zohoRequest("GET", path);
 const zohoPOST = (path, body) => zohoRequest("POST", path, body);
 const zohoPUT = (path, body) => zohoRequest("PUT", path, body);
+
+// -------------------------
+// Zoho attachment upload (PDF)
+// Zoho expects multipart/form-data: POST /crm/v2/Leads/{id}/Attachments :contentReference[oaicite:1]{index=1}
+// -------------------------
+function extractBase64Payload(maybeDataUrlOrBase64) {
+  const s = String(maybeDataUrlOrBase64 || "").trim();
+  if (!s) return "";
+
+  // If it’s a data URL like: data:application/pdf;base64,AAAA...
+  const commaIdx = s.indexOf(",");
+  if (s.startsWith("data:") && commaIdx !== -1) {
+    return s.slice(commaIdx + 1).trim();
+  }
+
+  return s;
+}
+
+async function uploadLeadPdfAttachment({ leadId, submissionPdfBase64, filename }) {
+  const b64 = extractBase64Payload(submissionPdfBase64);
+  if (!b64) return { uploaded: false, reason: "no_pdf" };
+
+  let buf;
+  try {
+    buf = Buffer.from(b64, "base64");
+  } catch {
+    return { uploaded: false, reason: "invalid_base64" };
+  }
+
+  if (!buf || !buf.length) return { uploaded: false, reason: "empty_pdf" };
+  if (buf.length > PDF_ATTACHMENT_MAX_BYTES) {
+    return { uploaded: false, reason: `pdf_too_large_${buf.length}` };
+  }
+
+  // Node 22 provides global FormData + Blob; node-fetch works with them.
+  const form = new FormData();
+  const blob = new Blob([buf], { type: "application/pdf" });
+  form.append("file", blob, filename);
+
+  const token = await getAccessToken();
+
+  const res = await fetch(
+    `${ZOHO_API_BASE}/crm/v2/${MODULE_LEADS}/${leadId}/Attachments`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Zoho-oauthtoken ${token}`,
+        // DO NOT set Content-Type; fetch will set multipart boundary
+      },
+      body: form,
+    }
+  );
+
+  const text = await res.text();
+  let data;
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch {
+    data = { raw: text };
+  }
+
+  if (!res.ok) {
+    const err = new Error(`Zoho attachment upload error ${res.status}`);
+    err.zoho = data;
+    err.httpStatus = res.status;
+    throw err;
+  }
+
+  return { uploaded: true, data };
+}
 
 // -------------------------
 // Zoho Tasks on errors (Subject + Status required)
@@ -534,8 +606,7 @@ async function searchLeadByPhoneE164(phoneE164) {
 
 async function getLeadByIdForAppend(leadId) {
   const record = await zohoGET(`/crm/v2/${MODULE_LEADS}/${leadId}`);
-  const lead = record?.data?.[0] || null;
-  return lead;
+  return record?.data?.[0] || null;
 }
 
 async function createLead(payload) {
@@ -578,20 +649,19 @@ function buildEntryString(submission, type, extra = {}) {
     (extra.phone ? ` | phone=${extra.phone}` : "") +
     ` =====\n`;
 
+  // NOTE: includes submission_pdf too; that's OK if you want "entire payload" in the text field.
   return header + safeJsonStringify(submission, QUESTIONNAIRE_DETAILS_MAX_CHARS) + "\n\n";
 }
 
 function clampToMaxCharsKeepNewest(text, maxChars) {
   const s = String(text || "");
   if (s.length <= maxChars) return s;
-  // Keep newest content (tail)
   return "[TRUNCATED_OLD_ENTRIES]\n\n" + s.slice(s.length - maxChars);
 }
 
 async function attachAppendedQuestionnaireDetails(leadIdOrNull, payload, submission, type, ctx) {
   const newEntry = buildEntryString(submission, type, ctx);
 
-  // If no lead yet (creating), just set entry as field
   if (!leadIdOrNull) {
     return {
       ...payload,
@@ -599,13 +669,11 @@ async function attachAppendedQuestionnaireDetails(leadIdOrNull, payload, submiss
     };
   }
 
-  // Append to existing
   let existing = "";
   try {
     const lead = await getLeadByIdForAppend(leadIdOrNull);
     existing = String(lead?.[FIELD_QUESTIONNAIRE_DETAILS] || "");
   } catch {
-    // If we can’t read existing, still write at least the newest entry
     existing = "";
   }
 
@@ -618,7 +686,7 @@ async function attachAppendedQuestionnaireDetails(leadIdOrNull, payload, submiss
 }
 
 // -------------------------
-// Mapping to Zoho Leads API names (without Questionnaire_Details; we append later)
+// Mapping to Zoho Leads API names (base; we append later)
 // -------------------------
 function mapLeadBase(submission) {
   const phone = normalizePhoneE164(submission.phone_country_code, submission.phone_number);
@@ -727,7 +795,8 @@ function isDuplicatePhoneZohoError(zohoErr) {
 // -------------------------
 // Submissions endpoint
 // - Always APPEND payload to Leads.Questionnaire_Details (even on success)
-// - On Zoho errors, also create Zoho Task (Backlogged) with payload + error
+// - If submission_pdf present, upload as PDF attachment to the Lead
+// - On Zoho errors, create Zoho Task (Backlogged) with payload + error
 // -------------------------
 app.post("/api/submissions", async (req, res) => {
   const submission = req.body || {};
@@ -737,6 +806,7 @@ app.post("/api/submissions", async (req, res) => {
   const email = String(submission.email || "").trim();
   const phoneE164 = normalizePhoneE164(submission.phone_country_code, submission.phone_number);
 
+  const submissionPdf = submission.submission_pdf; // base64 PDF
   let lead = null;
 
   try {
@@ -787,9 +857,28 @@ app.post("/api/submissions", async (req, res) => {
       } catch (e) {
         const zohoErr = e?.zoho || null;
 
-        // Duplicate phone: retry update without phone fields (still appends Questionnaire_Details)
+        // Duplicate phone: retry update without phone fields
         if (isDuplicatePhoneZohoError(zohoErr)) {
           await updateLead(lead.id, stripPhoneFields(payload));
+
+          // Upload PDF attachment (best-effort) after lead update
+          if (submissionPdf) {
+            try {
+              const fname = `Eligibility_Summary_${todayYYYYMMDD()}_${sessionId || "no_session"}.pdf`;
+              await uploadLeadPdfAttachment({ leadId: lead.id, submissionPdfBase64: submissionPdf, filename: fname });
+            } catch (attErr) {
+              await createZohoErrorTask({
+                leadId: lead.id,
+                submissionType: type,
+                sessionId,
+                email,
+                phoneE164,
+                errorMessage: `Attachment upload failed: ${String(attErr?.message || attErr)}`,
+                zohoDetails: attErr?.zoho || null,
+                submissionPayload: submission,
+              });
+            }
+          }
 
           await createZohoErrorTask({
             leadId: lead.id,
@@ -812,6 +901,27 @@ app.post("/api/submissions", async (req, res) => {
       lead = { id: newId };
     }
 
+    // Upload PDF attachment (best-effort) after successful upsert
+    if (submissionPdf && lead?.id) {
+      try {
+        const fname = `Eligibility_Summary_${todayYYYYMMDD()}_${sessionId || "no_session"}.pdf`;
+        await uploadLeadPdfAttachment({ leadId: lead.id, submissionPdfBase64: submissionPdf, filename: fname });
+      } catch (attErr) {
+        // Don’t fail the whole submission; log via task
+        await createZohoErrorTask({
+          leadId: lead.id,
+          submissionType: type,
+          sessionId,
+          email,
+          phoneE164,
+          errorMessage: `Attachment upload failed: ${String(attErr?.message || attErr)}`,
+          zohoDetails: attErr?.zoho || null,
+          submissionPayload: submission,
+        });
+        return res.json({ success: true, warning: "lead_saved_attachment_failed" });
+      }
+    }
+
     return res.json({ success: true });
   } catch (e) {
     const zohoErr = e?.zoho || null;
@@ -829,7 +939,6 @@ app.post("/api/submissions", async (req, res) => {
 
     // PHI-safe server log (no req.body)
     console.error("[POST /api/submissions] error:", String(e?.message || e));
-
     return res.status(500).json({ success: false, error: "submission failed" });
   }
 });
