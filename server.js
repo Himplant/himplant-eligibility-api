@@ -5,7 +5,7 @@ import fetch from "node-fetch";
 const app = express();
 
 // Keep payload size reasonable (PHI safety + abuse protection)
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "5mb" }));
 
 /**
  * HIPAA best practices:
