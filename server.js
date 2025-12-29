@@ -48,6 +48,9 @@ const MODULE_SURGEONS = "Surgeons";
 const MODULE_LEADS = "Leads";
 const MODULE_TASKS = "Tasks";
 
+// Leads multiline field to store entire payload ALWAYS
+const FIELD_QUESTIONNAIRE_DETAILS = "Questionnaire_Details";
+
 // Surgeons fields (Zoho API names)
 const FIELD_ACTIVE = "Active_Status";
 const FIELD_COUNTRY = "Country";
@@ -331,7 +334,7 @@ function shouldCreateErrorTasks() {
  * - full submission payload JSON
  * Required fields in YOUR Zoho:
  * - Subject
- * - Status (must be "Backlogged")
+ * - Status = Backlogged
  */
 async function createZohoErrorTask({
   leadId,
@@ -362,17 +365,15 @@ async function createZohoErrorTask({
 
   const taskRecord = pruneEmpty({
     Subject: subject,
-    Status: "Backlogged",      // ✅ REQUIRED in your Zoho
-    Due_Date: todayYYYYMMDD(), // ✅ same-day due date
+    Status: "Backlogged",
+    Due_Date: todayYYYYMMDD(),
     Description: description,
-    // Link to the Lead if we have it (Tasks can relate to Leads via Who_Id)
-    Who_Id: leadId || null,
+    Who_Id: leadId || null, // relate task to Lead when possible
   });
 
   try {
     await zohoPOST(`/crm/v2/${MODULE_TASKS}`, { data: [taskRecord] });
   } catch (e) {
-    // Never throw from here; avoid cascading failure loops
     console.error("[Zoho Task] failed:", String(e.message || e));
   }
 }
@@ -589,11 +590,20 @@ async function updateLead(leadId, payload) {
 
 // -------------------------
 // Mapping to Zoho Leads API names
+// NOTE: We inject Questionnaire_Details in ALL types
 // -------------------------
+function attachQuestionnaireDetails(payload, submission) {
+  // Store entire payload JSON in Leads.Multiline field
+  return {
+    ...payload,
+    [FIELD_QUESTIONNAIRE_DETAILS]: safeJsonStringify(submission, 28000),
+  };
+}
+
 function mapLeadToZohoLead(submission) {
   const phone = normalizePhoneE164(submission.phone_country_code, submission.phone_number);
 
-  return pruneEmpty({
+  const base = pruneEmpty({
     First_Name: nullableText(submission.first_name),
     Last_Name: nullableText(submission.last_name),
     Email: nullableText(submission.email),
@@ -609,12 +619,14 @@ function mapLeadToZohoLead(submission) {
 
     Intake_Date: nullableText(submission.submitted_at) || new Date().toISOString(),
   });
+
+  return attachQuestionnaireDetails(base, submission);
 }
 
 function mapPartialToZohoLead(submission) {
   const phone = normalizePhoneE164(submission.phone_country_code, submission.phone_number);
 
-  return pruneEmpty({
+  const base = pruneEmpty({
     First_Name: nullableText(submission.first_name),
     Last_Name: nullableText(submission.last_name),
     Email: nullableText(submission.email),
@@ -630,12 +642,14 @@ function mapPartialToZohoLead(submission) {
     Date_of_Birth: nullableText(submission.date_of_birth),
     Intake_Date: nullableText(submission.submitted_at) || new Date().toISOString(),
   });
+
+  return attachQuestionnaireDetails(base, submission);
 }
 
 function mapCompleteToZohoLead(submission) {
   const phone = normalizePhoneE164(submission.phone_country_code, submission.phone_number);
 
-  return pruneEmpty({
+  const base = pruneEmpty({
     First_Name: nullableText(submission.first_name),
     Last_Name: nullableText(submission.last_name),
     Email: nullableText(submission.email),
@@ -678,6 +692,8 @@ function mapCompleteToZohoLead(submission) {
 
     Intake_Date: nullableText(submission.submitted_at) || new Date().toISOString(),
   });
+
+  return attachQuestionnaireDetails(base, submission);
 }
 
 // -------------------------
@@ -700,7 +716,8 @@ function isDuplicatePhoneZohoError(zohoErr) {
 // - partial: create/update by Email -> Phone
 // - complete: update by Session_ID -> Email -> Phone; if matched by email/phone, bind Session_ID
 //
-// On any Zoho error, create a Zoho Task for manual resolution.
+// Always stores full payload to Leads.Questionnaire_Details (even on success).
+// On any Zoho error, creates a Zoho Task (Backlogged) with payload + error.
 // -------------------------
 app.post("/api/submissions", async (req, res) => {
   const submission = req.body || {};
@@ -733,7 +750,7 @@ app.post("/api/submissions", async (req, res) => {
     if (!lead && email) lead = await searchLeadByEmail(email);
     if (!lead && phoneE164) lead = await searchLeadByPhoneE164(phoneE164);
 
-    // Build payload per type
+    // Build payload per type (includes Questionnaire_Details always)
     const payload =
       type === "lead"
         ? mapLeadToZohoLead(submission)
@@ -751,7 +768,7 @@ app.post("/api/submissions", async (req, res) => {
       } catch (e) {
         const zohoErr = e?.zoho || null;
 
-        // If duplicate phone, retry update without phone fields, and still log task for manual resolution
+        // If duplicate phone, retry update without phone fields (Questionnaire_Details still updates)
         if (isDuplicatePhoneZohoError(zohoErr)) {
           await updateLead(lead.id, stripPhoneFields(payload));
 
@@ -780,7 +797,6 @@ app.post("/api/submissions", async (req, res) => {
   } catch (e) {
     const zohoErr = e?.zoho || null;
 
-    // Create Zoho Task on any failure (best-effort)
     await createZohoErrorTask({
       leadId: lead?.id || null,
       submissionType: type,
