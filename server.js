@@ -51,7 +51,7 @@ const MODULE_TASKS = "Tasks";
 // Leads multiline field to store payload history
 const FIELD_QUESTIONNAIRE_DETAILS = "Questionnaire_Details";
 
-// Max chars to keep in Questionnaire_Details (Zoho multiline fields have limits; keep safely under typical caps)
+// Max chars to keep in Questionnaire_Details
 const QUESTIONNAIRE_DETAILS_MAX_CHARS = 28000;
 
 // Surgeons fields (Zoho API names)
@@ -541,28 +541,44 @@ async function getLeadByIdForAppend(leadId) {
 async function createLead(payload) {
   const resp = await zohoPOST(`/crm/v2/${MODULE_LEADS}`, { data: [payload] });
   const first = resp?.data?.[0];
+
   if (first?.status !== "success") {
     const err = new Error("createLead failed");
     err.zoho = first || resp;
+
+    // IMPORTANT: Zoho can return HTTP 200 with status:error inside the body.
+    // Treat as non-retryable validation/mapping failure.
+    err.httpStatus = 400;
+
     throw err;
   }
+
   const id = first?.details?.id;
   if (!id) {
     const err = new Error("createLead failed (no id returned)");
     err.zoho = first || resp;
+    err.httpStatus = 400;
     throw err;
   }
+
   return id;
 }
 
 async function updateLead(leadId, payload) {
   const resp = await zohoPUT(`/crm/v2/${MODULE_LEADS}/${leadId}`, { data: [payload] });
   const first = resp?.data?.[0];
+
   if (first?.status !== "success") {
     const err = new Error("updateLead failed");
     err.zoho = first || resp;
+
+    // IMPORTANT: Zoho can return HTTP 200 with status:error inside the body.
+    // Treat as non-retryable validation/mapping failure.
+    err.httpStatus = 400;
+
     throw err;
   }
+
   return true;
 }
 
@@ -584,14 +600,12 @@ function buildEntryString(submission, type, extra = {}) {
 function clampToMaxCharsKeepNewest(text, maxChars) {
   const s = String(text || "");
   if (s.length <= maxChars) return s;
-  // Keep newest content (tail)
   return "[TRUNCATED_OLD_ENTRIES]\n\n" + s.slice(s.length - maxChars);
 }
 
 async function attachAppendedQuestionnaireDetails(leadIdOrNull, payload, submission, type, ctx) {
   const newEntry = buildEntryString(submission, type, ctx);
 
-  // If no lead yet (creating), just set entry as field
   if (!leadIdOrNull) {
     return {
       ...payload,
@@ -599,13 +613,11 @@ async function attachAppendedQuestionnaireDetails(leadIdOrNull, payload, submiss
     };
   }
 
-  // Append to existing
   let existing = "";
   try {
     const lead = await getLeadByIdForAppend(leadIdOrNull);
     existing = String(lead?.[FIELD_QUESTIONNAIRE_DETAILS] || "");
   } catch {
-    // If we can’t read existing, still write at least the newest entry
     existing = "";
   }
 
@@ -618,7 +630,21 @@ async function attachAppendedQuestionnaireDetails(leadIdOrNull, payload, submiss
 }
 
 // -------------------------
-// Mapping to Zoho Leads API names (without Questionnaire_Details; we append later)
+// Duplicate phone safe retry
+// -------------------------
+function stripPhoneFields(payload) {
+  const { Phone, Mobile, ...rest } = payload || {};
+  return rest;
+}
+
+function isDuplicatePhoneZohoError(zohoErr) {
+  const code = zohoErr?.code;
+  const api = zohoErr?.details?.api_name;
+  return code === "DUPLICATE_DATA" && (api === "Phone" || api === "Mobile");
+}
+
+// -------------------------
+// Mapping to Zoho Leads API names
 // -------------------------
 function mapLeadBase(submission) {
   const phone = normalizePhoneE164(submission.phone_country_code, submission.phone_number);
@@ -711,23 +737,7 @@ function mapCompleteBase(submission) {
 }
 
 // -------------------------
-// Duplicate phone safe retry
-// -------------------------
-function stripPhoneFields(payload) {
-  const { Phone, Mobile, ...rest } = payload || {};
-  return rest;
-}
-
-function isDuplicatePhoneZohoError(zohoErr) {
-  const code = zohoErr?.code;
-  const api = zohoErr?.details?.api_name;
-  return code === "DUPLICATE_DATA" && (api === "Phone" || api === "Mobile");
-}
-
-// -------------------------
 // Submissions endpoint
-// - Always APPEND payload to Leads.Questionnaire_Details (even on success)
-// - On Zoho errors, also create Zoho Task (Backlogged) with payload + error
 // -------------------------
 app.post("/api/submissions", async (req, res) => {
   const submission = req.body || {};
@@ -771,7 +781,7 @@ app.post("/api/submissions", async (req, res) => {
     // If complete and matched by email/phone, bind session id
     if (type === "complete" && lead?.id && sessionId) payloadBase.Session_ID = sessionId;
 
-    // Append Questionnaire_Details (reads existing if lead exists)
+    // Append Questionnaire_Details
     let payload = await attachAppendedQuestionnaireDetails(
       lead?.id || null,
       payloadBase,
@@ -787,7 +797,7 @@ app.post("/api/submissions", async (req, res) => {
       } catch (e) {
         const zohoErr = e?.zoho || null;
 
-        // Duplicate phone: retry update without phone fields (still appends Questionnaire_Details)
+        // Duplicate phone: retry update without phone fields
         if (isDuplicatePhoneZohoError(zohoErr)) {
           await updateLead(lead.id, stripPhoneFields(payload));
 
@@ -835,8 +845,7 @@ app.post("/api/submissions", async (req, res) => {
       zohoHttp ? `(zoho_http=${zohoHttp})` : ""
     );
 
-    // Zoho 4xx = validation/mapping issue; retry won't fix it.
-    // Return 200 so UX doesn't break and the outbox doesn't retry forever.
+    // Zoho 4xx (or body-status errors we mark as 400) = validation/mapping issue; retry won't fix it.
     const isNonRetryableZohoError = zohoHttp && zohoHttp >= 400 && zohoHttp < 500;
 
     if (isNonRetryableZohoError) {
@@ -845,6 +854,7 @@ app.post("/api/submissions", async (req, res) => {
         warning: "zoho_rejected_payload_manual_review_needed",
         zoho_http: zohoHttp,
         zoho_code: zohoErr?.code || null,
+        zoho_api_name: zohoErr?.details?.api_name || null,
       });
     }
 
