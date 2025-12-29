@@ -815,6 +815,7 @@ app.post("/api/submissions", async (req, res) => {
     return res.json({ success: true });
   } catch (e) {
     const zohoErr = e?.zoho || null;
+    const zohoHttp = e?.httpStatus || null;
 
     await createZohoErrorTask({
       leadId: lead?.id || null,
@@ -828,8 +829,26 @@ app.post("/api/submissions", async (req, res) => {
     });
 
     // PHI-safe server log (no req.body)
-    console.error("[POST /api/submissions] error:", String(e?.message || e));
+    console.error(
+      "[POST /api/submissions] error:",
+      String(e?.message || e),
+      zohoHttp ? `(zoho_http=${zohoHttp})` : ""
+    );
 
+    // Zoho 4xx = validation/mapping issue; retry won't fix it.
+    // Return 200 so UX doesn't break and the outbox doesn't retry forever.
+    const isNonRetryableZohoError = zohoHttp && zohoHttp >= 400 && zohoHttp < 500;
+
+    if (isNonRetryableZohoError) {
+      return res.status(200).json({
+        success: true,
+        warning: "zoho_rejected_payload_manual_review_needed",
+        zoho_http: zohoHttp,
+        zoho_code: zohoErr?.code || null,
+      });
+    }
+
+    // 5xx/unknown errors should remain 500 so outbox retries later
     return res.status(500).json({ success: false, error: "submission failed" });
   }
 });
