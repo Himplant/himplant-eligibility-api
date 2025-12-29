@@ -3,15 +3,8 @@ import cors from "cors";
 import fetch from "node-fetch";
 
 const app = express();
-
-// allow base64 PDF payloads but keep limits reasonable
 app.use(express.json({ limit: "5mb" }));
 
-/**
- * HIPAA best practices:
- * - Restrict CORS to known production origins
- * - Do not log request bodies (PHI)
- */
 const ALLOWED_ORIGINS = [
   "https://eligibility.himplant.com",
   "https://himplant.com",
@@ -30,11 +23,9 @@ app.use(
   })
 );
 
-// Zoho US endpoints
 const ZOHO_ACCOUNTS = "https://accounts.zoho.com";
 const ZOHO_API_BASE = "https://www.zohoapis.com";
 
-// Env
 const {
   ZOHO_CLIENT_ID,
   ZOHO_CLIENT_SECRET,
@@ -42,19 +33,15 @@ const {
   CREATE_ZOHO_ERROR_TASKS,
 } = process.env;
 
-// Modules
 const MODULE_SURGEONS = "Surgeons";
 const MODULE_LEADS = "Leads";
 const MODULE_TASKS = "Tasks";
 
-// Leads multiline field to store payload history
 const FIELD_QUESTIONNAIRE_DETAILS = "Questionnaire_Details";
 const QUESTIONNAIRE_DETAILS_MAX_CHARS = 28000;
 
-// Attachment caps
-const PDF_ATTACHMENT_MAX_BYTES = 18 * 1024 * 1024; // 18MB conservative
+const PDF_ATTACHMENT_MAX_BYTES = 18 * 1024 * 1024;
 
-// Surgeons fields
 const FIELD_ACTIVE = "Active_Status";
 const FIELD_COUNTRY = "Country";
 const FIELD_STATE = "State";
@@ -65,12 +52,11 @@ const FIELD_BOOK_EN = "Consult_Booking_EN";
 const FIELD_BOOK_ES = "Consult_Booking_ES";
 const FIELD_BOOK_AR = "Consult_Booking_AR";
 
-// Access token cache
 let cachedAccessToken = null;
 let tokenExpiresAt = 0;
 
 // -------------------------
-// Helpers (PHI-safe)
+// Helpers
 // -------------------------
 function digitsOnly(s) {
   return String(s || "").replace(/\D/g, "");
@@ -154,7 +140,6 @@ function toMultilineText(value) {
   return s ? s : null;
 }
 
-// Phone normalization (you said you’ll expand later)
 const ISO_TO_DIAL = {
   US: "1",
   CA: "1",
@@ -187,7 +172,6 @@ function normalizePhoneE164(countryCodeOrDial, phoneNumber) {
 
   const pn = digitsOnly(raw);
   const ccRaw = String(countryCodeOrDial || "").trim().toUpperCase();
-
   const dial =
     ISO_TO_DIAL[ccRaw] || (digitsOnly(ccRaw) ? digitsOnly(ccRaw) : "");
 
@@ -241,13 +225,7 @@ function shouldCreateErrorTasks() {
   return String(CREATE_ZOHO_ERROR_TASKS).toLowerCase() === "true";
 }
 
-/**
- * PHI-safe extraction of Zoho error details for logging + response.
- * No payload values, only codes + which field failed.
- */
 function summarizeZohoError(zohoObj) {
-  // Zoho often returns:
-  // { data: [{ code, message, details: { api_name, expected_data_type, ... }, status }] }
   const d0 = zohoObj?.data?.[0] || zohoObj || {};
   const details = d0?.details || {};
   return pruneEmpty({
@@ -354,13 +332,9 @@ async function uploadLeadPdfAttachment({ leadId, submissionPdfBase64, filename }
   form.append("file", blob, filename);
 
   const token = await getAccessToken();
-
   const res = await fetch(`${ZOHO_API_BASE}/crm/v2/${MODULE_LEADS}/${leadId}/Attachments`, {
     method: "POST",
-    headers: {
-      Authorization: `Zoho-oauthtoken ${token}`,
-      // do not set Content-Type
-    },
+    headers: { Authorization: `Zoho-oauthtoken ${token}` },
     body: form,
   });
 
@@ -397,15 +371,16 @@ async function createZohoErrorTask({
 }) {
   if (!shouldCreateErrorTasks()) return;
 
-  const subject = [
-    "Eligibility API Error",
-    submissionType ? `(${submissionType})` : "",
-    email ? `email:${email}` : "",
-    phoneE164 ? `phone:${phoneE164}` : "",
-  ]
-    .filter(Boolean)
-    .join(" ")
-    .trim() || "Eligibility API Error";
+  const subject =
+    [
+      "Eligibility API Error",
+      submissionType ? `(${submissionType})` : "",
+      email ? `email:${email}` : "",
+      phoneE164 ? `phone:${phoneE164}` : "",
+    ]
+      .filter(Boolean)
+      .join(" ")
+      .trim() || "Eligibility API Error";
 
   const description =
     `Error Message:\n${errorMessage || "(none)"}\n\n` +
@@ -434,7 +409,7 @@ async function createZohoErrorTask({
 app.get("/health", (req, res) => res.json({ ok: true }));
 
 // -------------------------
-// CMS endpoints
+// CMS
 // -------------------------
 app.get("/api/geo/countries", async (req, res) => {
   try {
@@ -582,7 +557,7 @@ async function searchLeadByPhoneE164(phoneE164) {
   return (data?.data || [])[0] || null;
 }
 
-async function getLeadByIdForAppend(leadId) {
+async function getLeadById(leadId) {
   const record = await zohoGET(`/crm/v2/${MODULE_LEADS}/${leadId}`);
   return record?.data?.[0] || null;
 }
@@ -595,13 +570,7 @@ async function createLead(payload) {
     err.zoho = first || resp;
     throw err;
   }
-  const id = first?.details?.id;
-  if (!id) {
-    const err = new Error("createLead failed (no id returned)");
-    err.zoho = first || resp;
-    throw err;
-  }
-  return id;
+  return first.details.id;
 }
 
 async function updateLead(leadId, payload) {
@@ -616,15 +585,15 @@ async function updateLead(leadId, payload) {
 }
 
 // -------------------------
-// Questionnaire_Details append logic
+// Questionnaire_Details best-effort append (DOES NOT BLOCK main upsert)
 // -------------------------
-function buildEntryString(submission, type, extra = {}) {
+function buildEntryString(submission, type, ctx) {
   const ts = new Date().toISOString();
   const header =
     `===== ${ts} | submission_type=${type || ""}` +
-    (extra.sessionId ? ` | session_id=${extra.sessionId}` : "") +
-    (extra.email ? ` | email=${extra.email}` : "") +
-    (extra.phone ? ` | phone=${extra.phone}` : "") +
+    (ctx.sessionId ? ` | session_id=${ctx.sessionId}` : "") +
+    (ctx.email ? ` | email=${ctx.email}` : "") +
+    (ctx.phone ? ` | phone=${ctx.phone}` : "") +
     ` =====\n`;
 
   return header + safeJsonStringify(submission, QUESTIONNAIRE_DETAILS_MAX_CHARS) + "\n\n";
@@ -636,34 +605,42 @@ function clampToMaxCharsKeepNewest(text, maxChars) {
   return "[TRUNCATED_OLD_ENTRIES]\n\n" + s.slice(s.length - maxChars);
 }
 
-async function attachAppendedQuestionnaireDetails(leadIdOrNull, payload, submission, type, ctx) {
-  const newEntry = buildEntryString(submission, type, ctx);
-
-  if (!leadIdOrNull) {
-    return {
-      ...payload,
-      [FIELD_QUESTIONNAIRE_DETAILS]: clampToMaxCharsKeepNewest(newEntry, QUESTIONNAIRE_DETAILS_MAX_CHARS),
-    };
-  }
-
-  let existing = "";
+async function bestEffortAppendQuestionnaireDetails(leadId, submission, type, ctx) {
   try {
-    const lead = await getLeadByIdForAppend(leadIdOrNull);
-    existing = String(lead?.[FIELD_QUESTIONNAIRE_DETAILS] || "");
-  } catch {
-    existing = "";
+    const lead = await getLeadById(leadId);
+    const existing = String(lead?.[FIELD_QUESTIONNAIRE_DETAILS] || "");
+    const entry = buildEntryString(submission, type, ctx);
+
+    const combined = existing ? existing + "\n" + entry : entry;
+
+    // IMPORTANT: Ensure it's a string (not object), clamp length
+    const updatePayload = {
+      [FIELD_QUESTIONNAIRE_DETAILS]: clampToMaxCharsKeepNewest(combined, QUESTIONNAIRE_DETAILS_MAX_CHARS),
+    };
+
+    await updateLead(leadId, updatePayload);
+    return { ok: true };
+  } catch (e) {
+    const zohoSummary = summarizeZohoError(e?.zoho);
+    console.error("[Questionnaire_Details append] failed:", zohoSummary);
+
+    await createZohoErrorTask({
+      leadId,
+      submissionType: type,
+      sessionId: ctx.sessionId,
+      email: ctx.email,
+      phoneE164: ctx.phone,
+      errorMessage: "Failed to append Questionnaire_Details (field type/layout mismatch likely).",
+      zohoDetails: e?.zoho || null,
+      submissionPayload: submission,
+    });
+
+    return { ok: false, zoho: zohoSummary };
   }
-
-  const combined = existing ? existing + "\n" + newEntry : newEntry;
-
-  return {
-    ...payload,
-    [FIELD_QUESTIONNAIRE_DETAILS]: clampToMaxCharsKeepNewest(combined, QUESTIONNAIRE_DETAILS_MAX_CHARS),
-  };
 }
 
 // -------------------------
-// Mapping to Zoho Leads API names (base; we append later)
+// Mapping (NO Questionnaire_Details here)
 // -------------------------
 function mapLeadBase(submission) {
   const phone = normalizePhoneE164(submission.phone_country_code, submission.phone_number);
@@ -756,19 +733,6 @@ function mapCompleteBase(submission) {
 }
 
 // -------------------------
-// Duplicate phone safe retry
-// -------------------------
-function stripPhoneFields(payload) {
-  const { Phone, Mobile, ...rest } = payload || {};
-  return rest;
-}
-
-function isDuplicatePhoneZohoError(zohoErr) {
-  const summary = summarizeZohoError(zohoErr);
-  return summary.code === "DUPLICATE_DATA" && (summary.api_name === "Phone" || summary.api_name === "Mobile");
-}
-
-// -------------------------
 // Submissions endpoint
 // -------------------------
 app.post("/api/submissions", async (req, res) => {
@@ -784,157 +748,81 @@ app.post("/api/submissions", async (req, res) => {
 
   try {
     if (!["lead", "partial", "complete"].includes(type)) {
-      return res.status(400).json({
-        success: false,
-        error: "submission_type must be 'lead', 'partial', or 'complete'.",
-      });
+      return res.status(400).json({ success: false, error: "invalid_submission_type" });
     }
 
     if ((type === "lead" || type === "complete") && !sessionId) {
-      return res.status(400).json({ success: false, error: `${type} submission requires session_id.` });
+      return res.status(400).json({ success: false, error: "missing_session_id" });
     }
 
     if (!sessionId && !email && !phoneE164) {
-      return res.status(400).json({ success: false, error: "Need session_id, email, or phone." });
+      return res.status(400).json({ success: false, error: "missing_identifiers" });
     }
 
-    // Find existing lead
+    // Find lead
     if (type === "complete" && sessionId) lead = await searchLeadBySessionId(sessionId);
     if (!lead && email) lead = await searchLeadByEmail(email);
     if (!lead && phoneE164) lead = await searchLeadByPhoneE164(phoneE164);
 
-    // Base payload
-    let payloadBase =
+    // Base payload for main upsert
+    const basePayload =
       type === "lead"
         ? mapLeadBase(submission)
         : type === "partial"
           ? mapPartialBase(submission)
           : mapCompleteBase(submission);
 
-    // Bind session id if complete matched by email/phone
-    if (type === "complete" && lead?.id && sessionId) payloadBase.Session_ID = sessionId;
+    if (type === "complete" && lead?.id && sessionId) basePayload.Session_ID = sessionId;
 
-    // Append Questionnaire_Details
-    let payload = await attachAppendedQuestionnaireDetails(
-      lead?.id || null,
-      payloadBase,
+    // Upsert main lead fields (DO NOT include Questionnaire_Details here)
+    let leadId = lead?.id;
+
+    if (leadId) {
+      await updateLead(leadId, basePayload);
+    } else {
+      leadId = await createLead(basePayload);
+    }
+
+    // Best-effort append Questionnaire_Details (does not block success)
+    const appendResult = await bestEffortAppendQuestionnaireDetails(
+      leadId,
       submission,
       type,
       { sessionId, email, phone: phoneE164 }
     );
 
-    // Upsert
-    if (lead?.id) {
+    // Best-effort attachment (does not block success)
+    let attachmentUploaded = false;
+    if (submissionPdf && leadId) {
       try {
-        await updateLead(lead.id, payload);
+        const fname = `Eligibility_Summary_${todayYYYYMMDD()}_${sessionId || "no_session"}.pdf`;
+        await uploadLeadPdfAttachment({ leadId, submissionPdfBase64: submissionPdf, filename: fname });
+        attachmentUploaded = true;
       } catch (e) {
-        const zohoSummary = summarizeZohoError(e?.zoho);
-
-        // PHI-safe logs: show which field/type Zoho rejected
-        console.error("[POST /api/submissions] Zoho updateLead failed:", zohoSummary);
-
-        // Duplicate phone => retry without phone fields (still appends Questionnaire_Details)
-        if (isDuplicatePhoneZohoError(e?.zoho)) {
-          await updateLead(lead.id, stripPhoneFields(payload));
-
-          // Best-effort attachment
-          if (submissionPdf) {
-            try {
-              const fname = `Eligibility_Summary_${todayYYYYMMDD()}_${sessionId || "no_session"}.pdf`;
-              await uploadLeadPdfAttachment({
-                leadId: lead.id,
-                submissionPdfBase64: submissionPdf,
-                filename: fname,
-              });
-            } catch (attErr) {
-              console.error("[Attachment] upload failed:", summarizeZohoError(attErr?.zoho) || String(attErr?.message || attErr));
-              await createZohoErrorTask({
-                leadId: lead.id,
-                submissionType: type,
-                sessionId,
-                email,
-                phoneE164,
-                errorMessage: `Attachment upload failed: ${String(attErr?.message || attErr)}`,
-                zohoDetails: attErr?.zoho || null,
-                submissionPayload: submission,
-              });
-            }
-          }
-
-          await createZohoErrorTask({
-            leadId: lead.id,
-            submissionType: type,
-            sessionId,
-            email,
-            phoneE164,
-            errorMessage: "Duplicate phone; updated without Phone/Mobile. Manual review needed.",
-            zohoDetails: e?.zoho || null,
-            submissionPayload: submission,
-          });
-
-          return res.json({ success: true, warning: "updated_without_phone_due_to_duplicate" });
-        }
-
-        // Create error task for any other update failure
+        console.error("[Attachment] upload failed:", summarizeZohoError(e?.zoho));
         await createZohoErrorTask({
-          leadId: lead.id,
+          leadId,
           submissionType: type,
           sessionId,
           email,
           phoneE164,
-          errorMessage: "updateLead failed",
+          errorMessage: "Attachment upload failed",
           zohoDetails: e?.zoho || null,
           submissionPayload: submission,
         });
-
-        // Return PHI-safe diagnostics to frontend
-        return res.status(400).json({
-          success: false,
-          error: "zoho_update_failed",
-          zoho: zohoSummary,
-        });
-      }
-    } else {
-      // Create lead
-      const newId = await createLead(payload);
-      lead = { id: newId };
-    }
-
-    // Best-effort PDF attachment after successful upsert
-    if (submissionPdf && lead?.id) {
-      try {
-        const fname = `Eligibility_Summary_${todayYYYYMMDD()}_${sessionId || "no_session"}.pdf`;
-        await uploadLeadPdfAttachment({
-          leadId: lead.id,
-          submissionPdfBase64: submissionPdf,
-          filename: fname,
-        });
-      } catch (attErr) {
-        console.error("[Attachment] upload failed:", summarizeZohoError(attErr?.zoho) || String(attErr?.message || attErr));
-        await createZohoErrorTask({
-          leadId: lead.id,
-          submissionType: type,
-          sessionId,
-          email,
-          phoneE164,
-          errorMessage: `Attachment upload failed: ${String(attErr?.message || attErr)}`,
-          zohoDetails: attErr?.zoho || null,
-          submissionPayload: submission,
-        });
-        return res.json({ success: true, warning: "lead_saved_attachment_failed" });
       }
     }
 
-    return res.json({ success: true });
+    return res.json({
+      success: true,
+      lead_id: leadId,
+      questionnaire_details_appended: appendResult.ok,
+      questionnaire_details_error: appendResult.ok ? null : appendResult.zoho,
+      pdf_uploaded: attachmentUploaded,
+    });
   } catch (e) {
     const zohoSummary = summarizeZohoError(e?.zoho);
-
-    // PHI-safe logs: show Zoho rejection summary if present
-    if (Object.keys(zohoSummary).length) {
-      console.error("[POST /api/submissions] Zoho error:", zohoSummary);
-    } else {
-      console.error("[POST /api/submissions] error:", String(e?.message || e));
-    }
+    console.error("[POST /api/submissions] main upsert failed:", zohoSummary);
 
     await createZohoErrorTask({
       leadId: lead?.id || null,
@@ -942,7 +830,7 @@ app.post("/api/submissions", async (req, res) => {
       sessionId,
       email,
       phoneE164,
-      errorMessage: String(e?.message || e),
+      errorMessage: "Main lead upsert failed",
       zohoDetails: e?.zoho || null,
       submissionPayload: submission,
     });
