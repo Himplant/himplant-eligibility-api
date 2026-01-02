@@ -8,7 +8,8 @@ app.use(express.json({ limit: "5mb" }));
 const ALLOWED_ORIGINS = [
   "https://eligibility.himplant.com",
   "https://himplant.com",
-  "https://www.himplant.com",
+  "https://www.himplant.com"
+  "https://himplanteligibility.lovable.app",
 ];
 
 app.use(
