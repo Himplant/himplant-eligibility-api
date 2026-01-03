@@ -39,8 +39,6 @@ const MODULE_LEADS = "Leads";
 const MODULE_TASKS = "Tasks";
 
 const FIELD_QUESTIONNAIRE_DETAILS = "Questionnaire_Details";
-
-// Keep this smaller to reduce Zoho rejecting it
 const QUESTIONNAIRE_DETAILS_MAX_CHARS = 20000;
 
 // Surgeons fields (Zoho API names)
@@ -54,20 +52,29 @@ const FIELD_BOOK_EN = "Consult_Booking_EN";
 const FIELD_BOOK_ES = "Consult_Booking_ES";
 const FIELD_BOOK_AR = "Consult_Booking_AR";
 
-// ✅ NEW: Surgeon Alias field (Surgeons module)
+// Surgeon alias (Surgeons module)
 const FIELD_SURGEON_ALIAS = "Surgeon_Alias";
 
-// ✅ NEW: Lead fields you requested
-const FIELD_LEAD_EMBED_SOURCE_URL = "embed_source_url"; // exists in Leads per your confirmation
-const FIELD_LEAD_SURGEON_NAME = "Pick_Your_Surgeon"; // Lead "Surgeon Name" field to store alias
+// Lead fields you requested
+const FIELD_LEAD_EMBED_SOURCE_URL = "embed_source_url"; // you confirmed this exists on Leads
+const FIELD_LEAD_SURGEON_NAME = "Pick_Your_Surgeon"; // picklist (must validate allowed values)
+
+// Keep lookup mapping unchanged
+const FIELD_LEAD_SURGEON_LOOKUP = "Surgeon_name_Lookup";
 
 let cachedAccessToken = null;
 let tokenExpiresAt = 0;
 
+// -------------------------
+// Debug logging
+// -------------------------
 function debugLog(...args) {
   if (DEBUG) console.log(...args);
 }
 
+// -------------------------
+// Utils
+// -------------------------
 function digitsOnly(s) {
   return String(s || "").replace(/\D/g, "");
 }
@@ -182,7 +189,6 @@ function normalizePhoneE164(countryCodeOrDial, phoneNumber) {
 
   const pn = digitsOnly(raw);
   const ccRaw = String(countryCodeOrDial || "").trim().toUpperCase();
-
   const dial = ISO_TO_DIAL[ccRaw] || (digitsOnly(ccRaw) ? digitsOnly(ccRaw) : "");
 
   if (!dial && !pn) return "";
@@ -225,7 +231,7 @@ function shouldCreateErrorTasks() {
   return String(CREATE_ZOHO_ERROR_TASKS).toLowerCase() === "true";
 }
 
-// ✅ Force Zoho automations to run
+// Force Zoho automations to run
 const ZOHO_TRIGGER = ["workflow", "blueprint"];
 
 // -------------------------
@@ -292,7 +298,78 @@ const zohoPOST = (path, body) => zohoRequest("POST", path, body);
 const zohoPUT = (path, body) => zohoRequest("PUT", path, body);
 
 // -------------------------
-// NEW: Surgeon alias fetch (authoritative from Zoho Surgeons module)
+// Zoho Field Metadata (Picklist validation)
+// -------------------------
+let leadPicklistCache = {
+  fetchedAt: 0,
+  // apiName -> Set(actual_value)
+  allowed: new Map(),
+};
+
+const PICKLIST_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+
+async function refreshLeadPicklistCacheIfNeeded() {
+  const now = Date.now();
+  if (leadPicklistCache.fetchedAt && now - leadPicklistCache.fetchedAt < PICKLIST_CACHE_TTL_MS) return;
+
+  try {
+    // Zoho settings endpoint to list fields
+    const meta = await zohoGET(`/crm/v2/settings/fields?module=${MODULE_LEADS}`);
+    const fields = meta?.fields || meta?.data || meta?.fields?.data || meta?.fields || [];
+
+    // The actual shape is meta.fields (Zoho) — handle defensively
+    const list = Array.isArray(meta?.fields) ? meta.fields : Array.isArray(meta?.data) ? meta.data : fields;
+
+    const allowed = new Map();
+
+    for (const f of list || []) {
+      const apiName = f?.api_name;
+      const dataType = String(f?.data_type || "").toLowerCase();
+      if (!apiName) continue;
+
+      if (dataType === "picklist") {
+        const values = f?.pick_list_values || [];
+        const set = new Set();
+        for (const pv of values) {
+          // Zoho picklist entry often has actual_value
+          const av = pv?.actual_value ?? pv?.display_value ?? pv?.value;
+          const s = String(av || "").trim();
+          if (s) set.add(s);
+        }
+        if (set.size) allowed.set(apiName, set);
+      }
+    }
+
+    leadPicklistCache = { fetchedAt: now, allowed };
+    debugLog("[Picklist cache] refreshed", { count: allowed.size });
+  } catch (e) {
+    // If this fails, do not block lead creation; just keep cache empty
+    console.error("[Picklist cache] refresh failed:", String(e?.message || e));
+    leadPicklistCache = { fetchedAt: now, allowed: new Map() };
+  }
+}
+
+async function coerceLeadPicklistValue(apiName, proposedValue) {
+  const v = String(proposedValue || "").trim();
+  if (!v) return null;
+
+  await refreshLeadPicklistCacheIfNeeded();
+
+  const allowedSet = leadPicklistCache.allowed.get(apiName);
+  if (!allowedSet) {
+    // If we can’t confirm allowed values, safest to NOT set picklist (avoids Zoho invalid)
+    debugLog(`[Picklist] No metadata for ${apiName}; omitting value "${v}"`);
+    return null;
+  }
+
+  if (allowedSet.has(v)) return v;
+
+  debugLog(`[Picklist] Value not allowed for ${apiName}; omitting value "${v}"`);
+  return null;
+}
+
+// -------------------------
+// Surgeon alias fetch (authoritative from Zoho Surgeons module)
 // -------------------------
 async function fetchSurgeonAlias(surgeonId) {
   const id = String(surgeonId || "").trim();
@@ -311,7 +388,7 @@ async function fetchSurgeonAlias(surgeonId) {
 }
 
 // -------------------------
-// Error Task (also triggers workflows/blueprints)
+// Error Task
 // -------------------------
 async function createZohoErrorTask({
   leadId,
@@ -364,7 +441,7 @@ async function createZohoErrorTask({
 app.get("/health", (req, res) => res.json({ ok: true }));
 
 // -------------------------
-// Surgeons endpoints (unchanged behavior)
+// Surgeons endpoints
 // -------------------------
 app.get("/api/geo/countries", async (req, res) => {
   try {
@@ -518,7 +595,7 @@ async function getLeadByIdForAppend(leadId) {
   return record?.data?.[0] || null;
 }
 
-// ✅ KEEP PRIORITY: Email -> Phone -> Session ID
+// KEEP PRIORITY: Email -> Phone -> Session ID (per your instruction)
 async function findLeadByPriority({ email, phoneE164, sessionId }) {
   if (email) {
     const byEmail = await searchLeadByEmail(email);
@@ -578,8 +655,17 @@ async function appendQuestionnaireDetailsToExistingLead(leadId, payload, submiss
 // -------------------------
 // Mapping to Zoho
 // -------------------------
-function mapLeadBase(submission, surgeonAlias) {
+async function mapLeadPicklistSurgeonNameFromAlias(alias) {
+  // Validate against Zoho allowed picklist values
+  const allowed = await coerceLeadPicklistValue(FIELD_LEAD_SURGEON_NAME, alias);
+  return allowed; // returns null if not allowed
+}
+
+async function mapLeadBase(submission, surgeonAlias) {
   const phone = normalizePhoneE164(submission.phone_country_code, submission.phone_number);
+
+  const surgeonPicklistValue = await mapLeadPicklistSurgeonNameFromAlias(surgeonAlias);
+
   return pruneEmpty({
     First_Name: nullableText(submission.first_name),
     Last_Name: nullableText(submission.last_name),
@@ -590,21 +676,23 @@ function mapLeadBase(submission, surgeonAlias) {
     State: nullableText(getCurrentState(submission)),
     Session_ID: nullableText(submission.session_id),
 
-    // ✅ Keep lookup mapping unchanged
-    Surgeon_name_Lookup: nullableText(submission.surgeon_id),
+    // Keep lookup mapping unchanged
+    [FIELD_LEAD_SURGEON_LOOKUP]: nullableText(submission.surgeon_id),
 
-    // ✅ NEW: embed source field on lead
+    // Lead field embed_source_url
     [FIELD_LEAD_EMBED_SOURCE_URL]: nullableText(submission.embed_source_url),
 
-    // ✅ NEW: map surgeon alias to lead surgeon name field
-    [FIELD_LEAD_SURGEON_NAME]: nullableText(surgeonAlias),
+    // Surgeon alias -> Lead surgeon name picklist (ONLY if Zoho accepts)
+    [FIELD_LEAD_SURGEON_NAME]: surgeonPicklistValue,
 
     Intake_Date: nullableText(submission.submitted_at) || new Date().toISOString(),
   });
 }
 
-function mapPartialBase(submission, surgeonAlias) {
+async function mapPartialBase(submission, surgeonAlias) {
   const phone = normalizePhoneE164(submission.phone_country_code, submission.phone_number);
+  const surgeonPicklistValue = await mapLeadPicklistSurgeonNameFromAlias(surgeonAlias);
+
   return pruneEmpty({
     First_Name: nullableText(submission.first_name),
     Last_Name: nullableText(submission.last_name),
@@ -616,19 +704,19 @@ function mapPartialBase(submission, surgeonAlias) {
     Session_ID: nullableText(submission.session_id),
     Date_of_Birth: nullableText(submission.date_of_birth),
 
-    // ✅ Keep lookup mapping unchanged
-    Surgeon_name_Lookup: nullableText(submission.surgeon_id),
+    // Keep lookup mapping unchanged
+    [FIELD_LEAD_SURGEON_LOOKUP]: nullableText(submission.surgeon_id),
 
-    // ✅ NEW
     [FIELD_LEAD_EMBED_SOURCE_URL]: nullableText(submission.embed_source_url),
-    [FIELD_LEAD_SURGEON_NAME]: nullableText(surgeonAlias),
+    [FIELD_LEAD_SURGEON_NAME]: surgeonPicklistValue,
 
     Intake_Date: nullableText(submission.submitted_at) || new Date().toISOString(),
   });
 }
 
-function mapCompleteBase(submission, surgeonAlias) {
+async function mapCompleteBase(submission, surgeonAlias) {
   const phone = normalizePhoneE164(submission.phone_country_code, submission.phone_number);
+  const surgeonPicklistValue = await mapLeadPicklistSurgeonNameFromAlias(surgeonAlias);
 
   return pruneEmpty({
     First_Name: nullableText(submission.first_name),
@@ -640,15 +728,13 @@ function mapCompleteBase(submission, surgeonAlias) {
 
     Country: nullableText(getCurrentCountry(submission)),
     State: nullableText(getCurrentState(submission)),
-
     Session_ID: nullableText(submission.session_id),
 
-    // ✅ Keep lookup mapping unchanged
-    Surgeon_name_Lookup: nullableText(submission.surgeon_id),
+    // Keep lookup mapping unchanged
+    [FIELD_LEAD_SURGEON_LOOKUP]: nullableText(submission.surgeon_id),
 
-    // ✅ NEW
     [FIELD_LEAD_EMBED_SOURCE_URL]: nullableText(submission.embed_source_url),
-    [FIELD_LEAD_SURGEON_NAME]: nullableText(surgeonAlias),
+    [FIELD_LEAD_SURGEON_NAME]: surgeonPicklistValue,
 
     Payment_Method: nullableText(submission.payment_method),
     Procedure_Timeline: nullableText(submission.timeline),
@@ -672,7 +758,7 @@ function mapCompleteBase(submission, surgeonAlias) {
         ? null
         : boolToYesNo(submission.recent_outbreak_6mo),
 
-    // NOTE: leaving as-is; change to toZohoJsonArray if your Zoho field is Multiselect
+    // Leaving as-is (depends on your Zoho field type)
     Medical_conditions_list: toMultilineText(submission.medical_conditions_list),
 
     Body_Type: nullableText(submission.body_type),
@@ -733,6 +819,54 @@ async function createLead(payload) {
     throw err;
   }
   return id;
+}
+
+// ✅ NEW: Create with recovery (prevents “no lead created” due to 1 bad field)
+async function createLeadWithRecovery(payload) {
+  let working = { ...payload };
+  const removed = [];
+
+  for (let attempt = 1; attempt <= 8; attempt++) {
+    try {
+      const id = await createLead(working);
+      return { id, removed_fields: removed };
+    } catch (e) {
+      const zohoErr = e?.zoho || null;
+
+      if (isDuplicateZohoErrorForField(zohoErr, "Email") && working.Email) {
+        working = stripEmailField(working);
+        removed.push("Email");
+        debugLog("[Zoho create] DUPLICATE Email -> strip Email and retry");
+        continue;
+      }
+
+      if (
+        (isDuplicateZohoErrorForField(zohoErr, "Phone") && (working.Phone || working.Mobile)) ||
+        (isDuplicateZohoErrorForField(zohoErr, "Mobile") && (working.Phone || working.Mobile))
+      ) {
+        working = stripPhoneFields(working);
+        removed.push("Phone", "Mobile");
+        debugLog("[Zoho create] DUPLICATE phone -> strip Phone/Mobile and retry");
+        continue;
+      }
+
+      if (isInvalidDataLike(zohoErr)) {
+        const apiName = getApiNameFromZohoErr(zohoErr);
+        if (apiName && Object.prototype.hasOwnProperty.call(working, apiName)) {
+          delete working[apiName];
+          removed.push(apiName);
+          console.log(`[Zoho create reject] removing field ${apiName} and retrying...`);
+          continue;
+        }
+      }
+
+      throw e;
+    }
+  }
+
+  const err = new Error("createLead failed after retries");
+  err.httpStatus = 500;
+  throw err;
 }
 
 async function updateLeadOnce(leadId, payload) {
@@ -829,16 +963,16 @@ app.post("/api/submissions", async (req, res) => {
     lead = found.lead;
     matchedBy = found.matchedBy;
 
-    // ✅ NEW: surgeon alias enrichment (ONLY for populating lead surgeon name)
+    // Surgeon alias enrichment (ONLY for populating lead surgeon name picklist)
     const surgeonId = String(submission.surgeon_id || "").trim();
     const surgeonAlias = surgeonId ? await fetchSurgeonAlias(surgeonId) : null;
 
-    let payloadBase =
+    const payloadBase =
       type === "lead"
-        ? mapLeadBase(submission, surgeonAlias)
+        ? await mapLeadBase(submission, surgeonAlias)
         : type === "partial"
-        ? mapPartialBase(submission, surgeonAlias)
-        : mapCompleteBase(submission, surgeonAlias);
+        ? await mapPartialBase(submission, surgeonAlias)
+        : await mapCompleteBase(submission, surgeonAlias);
 
     if (lead?.id) {
       const payloadWithAppend = await appendQuestionnaireDetailsToExistingLead(
@@ -878,8 +1012,13 @@ app.post("/api/submissions", async (req, res) => {
       [FIELD_QUESTIONNAIRE_DETAILS]: clampToMaxCharsKeepNewest(initialEntry, QUESTIONNAIRE_DETAILS_MAX_CHARS),
     };
 
-    const newId = await createLead(createPayload);
-    return res.json({ success: true, created: true, lead_id: newId });
+    const created = await createLeadWithRecovery(createPayload);
+    return res.json({
+      success: true,
+      created: true,
+      lead_id: created.id,
+      removed_fields: created.removed_fields || [],
+    });
   } catch (e) {
     const zohoErr = e?.zoho || null;
     const zohoHttp = e?.httpStatus || null;
