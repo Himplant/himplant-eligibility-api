@@ -29,13 +29,8 @@ app.use(
 const ZOHO_ACCOUNTS = "https://accounts.zoho.com";
 const ZOHO_API_BASE = "https://www.zohoapis.com";
 
-const {
-  ZOHO_CLIENT_ID,
-  ZOHO_CLIENT_SECRET,
-  ZOHO_REFRESH_TOKEN,
-  CREATE_ZOHO_ERROR_TASKS,
-  DEBUG_ZOHO,
-} = process.env;
+const { ZOHO_CLIENT_ID, ZOHO_CLIENT_SECRET, ZOHO_REFRESH_TOKEN, CREATE_ZOHO_ERROR_TASKS, DEBUG_ZOHO } =
+  process.env;
 
 const DEBUG = String(DEBUG_ZOHO || "").toLowerCase() === "true";
 
@@ -58,6 +53,13 @@ const FIELD_PRICE = "Surgery_Price";
 const FIELD_BOOK_EN = "Consult_Booking_EN";
 const FIELD_BOOK_ES = "Consult_Booking_ES";
 const FIELD_BOOK_AR = "Consult_Booking_AR";
+
+// ✅ NEW: Surgeon Alias field (Surgeons module)
+const FIELD_SURGEON_ALIAS = "Surgeon_Alias";
+
+// ✅ NEW: Lead fields you requested
+const FIELD_LEAD_EMBED_SOURCE_URL = "embed_source_url"; // exists in Leads per your confirmation
+const FIELD_LEAD_SURGEON_NAME = "Pick_Your_Surgeon"; // Lead "Surgeon Name" field to store alias
 
 let cachedAccessToken = null;
 let tokenExpiresAt = 0;
@@ -181,8 +183,7 @@ function normalizePhoneE164(countryCodeOrDial, phoneNumber) {
   const pn = digitsOnly(raw);
   const ccRaw = String(countryCodeOrDial || "").trim().toUpperCase();
 
-  const dial =
-    ISO_TO_DIAL[ccRaw] || (digitsOnly(ccRaw) ? digitsOnly(ccRaw) : "");
+  const dial = ISO_TO_DIAL[ccRaw] || (digitsOnly(ccRaw) ? digitsOnly(ccRaw) : "");
 
   if (!dial && !pn) return "";
   if (!dial) return pn ? `+${pn}` : "";
@@ -190,21 +191,11 @@ function normalizePhoneE164(countryCodeOrDial, phoneNumber) {
 }
 
 function getCurrentCountry(submission) {
-  return (
-    submission.current_location_country ||
-    submission.location_country ||
-    submission.country ||
-    ""
-  );
+  return submission.current_location_country || submission.location_country || submission.country || "";
 }
 
 function getCurrentState(submission) {
-  return (
-    submission.current_location_state ||
-    submission.location_state ||
-    submission.state ||
-    ""
-  );
+  return submission.current_location_state || submission.location_state || submission.state || "";
 }
 
 function pickBookingUrl(record, lang) {
@@ -255,9 +246,7 @@ async function getAccessToken() {
     grant_type: "refresh_token",
   });
 
-  const res = await fetch(`${ZOHO_ACCOUNTS}/oauth/v2/token?${params.toString()}`, {
-    method: "POST",
-  });
+  const res = await fetch(`${ZOHO_ACCOUNTS}/oauth/v2/token?${params.toString()}`, { method: "POST" });
 
   const data = await res.json().catch(() => ({}));
   if (!res.ok || !data.access_token) {
@@ -301,6 +290,25 @@ async function zohoRequest(method, path, body) {
 const zohoGET = (path) => zohoRequest("GET", path);
 const zohoPOST = (path, body) => zohoRequest("POST", path, body);
 const zohoPUT = (path, body) => zohoRequest("PUT", path, body);
+
+// -------------------------
+// NEW: Surgeon alias fetch (authoritative from Zoho Surgeons module)
+// -------------------------
+async function fetchSurgeonAlias(surgeonId) {
+  const id = String(surgeonId || "").trim();
+  if (!id) return null;
+
+  try {
+    const record = await zohoGET(`/crm/v2/${MODULE_SURGEONS}/${id}`);
+    const s = record?.data?.[0];
+    if (!s) return null;
+
+    const alias = String(s?.[FIELD_SURGEON_ALIAS] || "").trim();
+    return alias || null;
+  } catch {
+    return null;
+  }
+}
 
 // -------------------------
 // Error Task (also triggers workflows/blueprints)
@@ -356,14 +364,12 @@ async function createZohoErrorTask({
 app.get("/health", (req, res) => res.json({ ok: true }));
 
 // -------------------------
-// Surgeons endpoints
+// Surgeons endpoints (unchanged behavior)
 // -------------------------
 app.get("/api/geo/countries", async (req, res) => {
   try {
     const criteria = `(${FIELD_ACTIVE}:equals:true)`;
-    const data = await zohoGET(
-      `/crm/v2/${MODULE_SURGEONS}/search?criteria=${encodeURIComponent(criteria)}`
-    );
+    const data = await zohoGET(`/crm/v2/${MODULE_SURGEONS}/search?criteria=${encodeURIComponent(criteria)}`);
 
     const countries = new Set();
     for (const r of data?.data || []) {
@@ -383,9 +389,7 @@ app.get("/api/geo/states", async (req, res) => {
     if (country !== "United States") return res.json([]);
 
     const criteria = `(${FIELD_ACTIVE}:equals:true) and (${FIELD_COUNTRY}:equals:${country})`;
-    const data = await zohoGET(
-      `/crm/v2/${MODULE_SURGEONS}/search?criteria=${encodeURIComponent(criteria)}`
-    );
+    const data = await zohoGET(`/crm/v2/${MODULE_SURGEONS}/search?criteria=${encodeURIComponent(criteria)}`);
 
     const states = new Set();
     for (const r of data?.data || []) {
@@ -406,13 +410,10 @@ app.get("/api/geo/cities", async (req, res) => {
 
     let criteria = `(${FIELD_ACTIVE}:equals:true) and (${FIELD_COUNTRY}:equals:${country})`;
     if (country === "United States" && state) {
-      criteria =
-        `(${FIELD_ACTIVE}:equals:true) and (${FIELD_COUNTRY}:equals:${country}) and (${FIELD_STATE}:equals:${state})`;
+      criteria = `(${FIELD_ACTIVE}:equals:true) and (${FIELD_COUNTRY}:equals:${country}) and (${FIELD_STATE}:equals:${state})`;
     }
 
-    const data = await zohoGET(
-      `/crm/v2/${MODULE_SURGEONS}/search?criteria=${encodeURIComponent(criteria)}`
-    );
+    const data = await zohoGET(`/crm/v2/${MODULE_SURGEONS}/search?criteria=${encodeURIComponent(criteria)}`);
 
     const cities = new Set();
     for (const r of data?.data || []) {
@@ -443,9 +444,7 @@ app.get("/api/surgeons", async (req, res) => {
         `(${FIELD_STATE}:equals:${state}) and (${FIELD_CITY}:equals:${city})`;
     }
 
-    const data = await zohoGET(
-      `/crm/v2/${MODULE_SURGEONS}/search?criteria=${encodeURIComponent(criteria)}`
-    );
+    const data = await zohoGET(`/crm/v2/${MODULE_SURGEONS}/search?criteria=${encodeURIComponent(criteria)}`);
 
     const surgeons = (data?.data || []).map((r) => {
       const bookingUrl = pickBookingUrl(r, lang);
@@ -494,9 +493,7 @@ async function searchLeadByEmail(email) {
   const e = String(email || "").trim();
   if (!e) return null;
   const criteria = `(Email:equals:${e})`;
-  const data = await zohoGET(
-    `/crm/v2/${MODULE_LEADS}/search?criteria=${encodeURIComponent(criteria)}`
-  );
+  const data = await zohoGET(`/crm/v2/${MODULE_LEADS}/search?criteria=${encodeURIComponent(criteria)}`);
   return (data?.data || [])[0] || null;
 }
 
@@ -504,9 +501,7 @@ async function searchLeadBySessionId(sessionId) {
   const s = String(sessionId || "").trim();
   if (!s) return null;
   const criteria = `(Session_ID:equals:${s})`;
-  const data = await zohoGET(
-    `/crm/v2/${MODULE_LEADS}/search?criteria=${encodeURIComponent(criteria)}`
-  );
+  const data = await zohoGET(`/crm/v2/${MODULE_LEADS}/search?criteria=${encodeURIComponent(criteria)}`);
   return (data?.data || [])[0] || null;
 }
 
@@ -514,9 +509,7 @@ async function searchLeadByPhoneE164(phoneE164) {
   const p = String(phoneE164 || "").trim();
   if (!p) return null;
   const criteria = `(Phone:equals:${p}) or (Mobile:equals:${p})`;
-  const data = await zohoGET(
-    `/crm/v2/${MODULE_LEADS}/search?criteria=${encodeURIComponent(criteria)}`
-  );
+  const data = await zohoGET(`/crm/v2/${MODULE_LEADS}/search?criteria=${encodeURIComponent(criteria)}`);
   return (data?.data || [])[0] || null;
 }
 
@@ -525,6 +518,7 @@ async function getLeadByIdForAppend(leadId) {
   return record?.data?.[0] || null;
 }
 
+// ✅ KEEP PRIORITY: Email -> Phone -> Session ID
 async function findLeadByPriority({ email, phoneE164, sessionId }) {
   if (email) {
     const byEmail = await searchLeadByEmail(email);
@@ -584,7 +578,7 @@ async function appendQuestionnaireDetailsToExistingLead(leadId, payload, submiss
 // -------------------------
 // Mapping to Zoho
 // -------------------------
-function mapLeadBase(submission) {
+function mapLeadBase(submission, surgeonAlias) {
   const phone = normalizePhoneE164(submission.phone_country_code, submission.phone_number);
   return pruneEmpty({
     First_Name: nullableText(submission.first_name),
@@ -595,12 +589,21 @@ function mapLeadBase(submission) {
     Country: nullableText(getCurrentCountry(submission)),
     State: nullableText(getCurrentState(submission)),
     Session_ID: nullableText(submission.session_id),
+
+    // ✅ Keep lookup mapping unchanged
     Surgeon_name_Lookup: nullableText(submission.surgeon_id),
+
+    // ✅ NEW: embed source field on lead
+    [FIELD_LEAD_EMBED_SOURCE_URL]: nullableText(submission.embed_source_url),
+
+    // ✅ NEW: map surgeon alias to lead surgeon name field
+    [FIELD_LEAD_SURGEON_NAME]: nullableText(surgeonAlias),
+
     Intake_Date: nullableText(submission.submitted_at) || new Date().toISOString(),
   });
 }
 
-function mapPartialBase(submission) {
+function mapPartialBase(submission, surgeonAlias) {
   const phone = normalizePhoneE164(submission.phone_country_code, submission.phone_number);
   return pruneEmpty({
     First_Name: nullableText(submission.first_name),
@@ -612,11 +615,19 @@ function mapPartialBase(submission) {
     State: nullableText(getCurrentState(submission)),
     Session_ID: nullableText(submission.session_id),
     Date_of_Birth: nullableText(submission.date_of_birth),
+
+    // ✅ Keep lookup mapping unchanged
+    Surgeon_name_Lookup: nullableText(submission.surgeon_id),
+
+    // ✅ NEW
+    [FIELD_LEAD_EMBED_SOURCE_URL]: nullableText(submission.embed_source_url),
+    [FIELD_LEAD_SURGEON_NAME]: nullableText(surgeonAlias),
+
     Intake_Date: nullableText(submission.submitted_at) || new Date().toISOString(),
   });
 }
 
-function mapCompleteBase(submission) {
+function mapCompleteBase(submission, surgeonAlias) {
   const phone = normalizePhoneE164(submission.phone_country_code, submission.phone_number);
 
   return pruneEmpty({
@@ -631,7 +642,13 @@ function mapCompleteBase(submission) {
     State: nullableText(getCurrentState(submission)),
 
     Session_ID: nullableText(submission.session_id),
+
+    // ✅ Keep lookup mapping unchanged
     Surgeon_name_Lookup: nullableText(submission.surgeon_id),
+
+    // ✅ NEW
+    [FIELD_LEAD_EMBED_SOURCE_URL]: nullableText(submission.embed_source_url),
+    [FIELD_LEAD_SURGEON_NAME]: nullableText(surgeonAlias),
 
     Payment_Method: nullableText(submission.payment_method),
     Procedure_Timeline: nullableText(submission.timeline),
@@ -655,6 +672,7 @@ function mapCompleteBase(submission) {
         ? null
         : boolToYesNo(submission.recent_outbreak_6mo),
 
+    // NOTE: leaving as-is; change to toZohoJsonArray if your Zoho field is Multiselect
     Medical_conditions_list: toMultilineText(submission.medical_conditions_list),
 
     Body_Type: nullableText(submission.body_type),
@@ -811,12 +829,16 @@ app.post("/api/submissions", async (req, res) => {
     lead = found.lead;
     matchedBy = found.matchedBy;
 
+    // ✅ NEW: surgeon alias enrichment (ONLY for populating lead surgeon name)
+    const surgeonId = String(submission.surgeon_id || "").trim();
+    const surgeonAlias = surgeonId ? await fetchSurgeonAlias(surgeonId) : null;
+
     let payloadBase =
       type === "lead"
-        ? mapLeadBase(submission)
+        ? mapLeadBase(submission, surgeonAlias)
         : type === "partial"
-          ? mapPartialBase(submission)
-          : mapCompleteBase(submission);
+        ? mapPartialBase(submission, surgeonAlias)
+        : mapCompleteBase(submission, surgeonAlias);
 
     if (lead?.id) {
       const payloadWithAppend = await appendQuestionnaireDetailsToExistingLead(
