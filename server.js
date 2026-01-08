@@ -11,6 +11,7 @@ const ALLOWED_ORIGINS = [
   "https://www.himplant.com",
   "https://lovableproject.com",
   "https://lovable.dev",
+  "https://bc248be2-fa03-4ded-a845-6db79ac12fb7.lovableproject.com",
   "https://himplanteligibility.lovable.app",
 ];
 
