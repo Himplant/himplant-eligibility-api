@@ -9,6 +9,7 @@ const ALLOWED_ORIGINS = [
   "https://eligibility.himplant.com",
   "https://himplant.com",
   "https://www.himplant.com",
+  "https://lovableproject.com",
   "https://lovable.dev",
   "https://himplanteligibility.lovable.app",
 ];
