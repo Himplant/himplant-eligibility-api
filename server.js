@@ -986,6 +986,17 @@ app.post("/api/submissions", async (req, res) => {
       ]);
 
       if ((upd.removed_fields || []).includes(FIELD_QUESTIONNAIRE_DETAILS)) {
+        await createZohoErrorTask({
+          leadId: lead.id,
+          submissionType: type,
+          sessionId,
+          email,
+          phoneE164,
+          errorMessage: "Zoho rejected Questionnaire_Details; full payload saved here.",
+          zohoDetails: { code: "QUESTIONNAIRE_DETAILS_REJECTED" },
+          submissionPayload: submission,
+        });
+      }
 
       return res.json({
         success: true,
@@ -1005,15 +1016,15 @@ app.post("/api/submissions", async (req, res) => {
     // Start both Zoho creation and Supabase webhook in parallel for speed
     const zohoCreatePromise = createLeadWithRecovery(createPayload);
     
-    let supabaseWebhookPromise = Promise.resolve(null);
+    let supabaseWebhookPromiseNoLead = Promise.resolve(null);
     if (type === "complete" && email) {
-      supabaseWebhookPromise = notifySupabaseEligibilityComplete(email);
+      supabaseWebhookPromiseNoLead = notifySupabaseEligibilityComplete(email);
     }
 
     // Wait for both to finish
-    const [created, supabaseWebhookResult] = await Promise.all([
+    const [created, supabaseWebhookResultNoLead] = await Promise.all([
       zohoCreatePromise,
-      supabaseWebhookPromise
+      supabaseWebhookPromiseNoLead
     ]);
 
     return res.json({
@@ -1021,7 +1032,7 @@ app.post("/api/submissions", async (req, res) => {
       created: true,
       lead_id: created.id,
       removed_fields: created.removed_fields || [],
-      supabase_webhook: supabaseWebhookResult,
+      supabase_webhook: supabaseWebhookResultNoLead,
     });
   } catch (e) {
     const zohoErr = e?.zoho || null;
