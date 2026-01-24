@@ -14,6 +14,13 @@ const ALLOWED_ORIGINS = [
   "https://lovable.dev",
   "https://bc248be2-fa03-4ded-a845-6db79ac12fb7.lovableproject.com",
   "https://himplanteligibility.lovable.app",
+  // TEMPORARY: Local development origins - REMOVE BEFORE DEPLOYING
+  "http://localhost:8080",
+  "http://localhost:3000",
+  "http://localhost:5173",
+  "http://127.0.0.1:8080",
+  "http://127.0.0.1:3000",
+  "http://127.0.0.1:5173",
 ];
 
 app.use(
@@ -21,6 +28,10 @@ app.use(
     origin: function (origin, callback) {
       if (!origin) return callback(null, true);
       if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+      // TEMPORARY: Allow any localhost origin for local testing - REMOVE BEFORE DEPLOYING
+      if (origin.startsWith("http://localhost:") || origin.startsWith("http://127.0.0.1:")) {
+        return callback(null, true);
+      }
       return callback(new Error("Not allowed by CORS"));
     },
     methods: ["GET", "POST", "OPTIONS"],
@@ -960,26 +971,21 @@ app.post("/api/submissions", async (req, res) => {
         { sessionId, email, phone: phoneE164 }
       );
 
-      const upd = await updateLeadWithRecovery(lead.id, payloadWithAppend);
+      // Start both Zoho update and Supabase webhook in parallel for speed
+      const zohoUpdatePromise = updateLeadWithRecovery(lead.id, payloadWithAppend);
+      
+      let supabaseWebhookPromise = Promise.resolve(null);
+      if (type === "complete" && email) {
+        supabaseWebhookPromise = notifySupabaseEligibilityComplete(email);
+      }
+
+      // Wait for both to finish
+      const [upd, supabaseWebhookResult] = await Promise.all([
+        zohoUpdatePromise,
+        supabaseWebhookPromise
+      ]);
 
       if ((upd.removed_fields || []).includes(FIELD_QUESTIONNAIRE_DETAILS)) {
-        await createZohoErrorTask({
-          leadId: lead.id,
-          submissionType: type,
-          sessionId,
-          email,
-          phoneE164,
-          errorMessage: "Zoho rejected Questionnaire_Details; full payload saved here.",
-          zohoDetails: { code: "QUESTIONNAIRE_DETAILS_REJECTED" },
-          submissionPayload: submission,
-        });
-      }
-
-      // Notify Supabase app to award bonus enhancements for complete submissions
-      let supabaseWebhookResult = null;
-      if (type === "complete" && email) {
-        supabaseWebhookResult = await notifySupabaseEligibilityComplete(email);
-      }
 
       return res.json({
         success: true,
@@ -996,13 +1002,19 @@ app.post("/api/submissions", async (req, res) => {
       [FIELD_QUESTIONNAIRE_DETAILS]: clampToMaxCharsKeepNewest(initialEntry, QUESTIONNAIRE_DETAILS_MAX_CHARS),
     };
 
-    const created = await createLeadWithRecovery(createPayload);
-
-    // Notify Supabase app to award bonus enhancements for complete submissions
-    let supabaseWebhookResult = null;
+    // Start both Zoho creation and Supabase webhook in parallel for speed
+    const zohoCreatePromise = createLeadWithRecovery(createPayload);
+    
+    let supabaseWebhookPromise = Promise.resolve(null);
     if (type === "complete" && email) {
-      supabaseWebhookResult = await notifySupabaseEligibilityComplete(email);
+      supabaseWebhookPromise = notifySupabaseEligibilityComplete(email);
     }
+
+    // Wait for both to finish
+    const [created, supabaseWebhookResult] = await Promise.all([
+      zohoCreatePromise,
+      supabaseWebhookPromise
+    ]);
 
     return res.json({
       success: true,
