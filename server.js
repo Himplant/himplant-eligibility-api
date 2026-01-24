@@ -1,3 +1,4 @@
+import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import fetch from "node-fetch";
@@ -31,8 +32,20 @@ app.use(
 const ZOHO_ACCOUNTS = "https://accounts.zoho.com";
 const ZOHO_API_BASE = "https://www.zohoapis.com";
 
-const { ZOHO_CLIENT_ID, ZOHO_CLIENT_SECRET, ZOHO_REFRESH_TOKEN, CREATE_ZOHO_ERROR_TASKS, DEBUG_ZOHO } =
-  process.env;
+const { 
+  ZOHO_CLIENT_ID, 
+  ZOHO_CLIENT_SECRET, 
+  ZOHO_REFRESH_TOKEN, 
+  CREATE_ZOHO_ERROR_TASKS, 
+  DEBUG_ZOHO,
+  SUPABASE_ELIGIBILITY_API_KEY,
+  SUPABASE_FUNCTION_URL,
+  SUPABASE_ANON_KEY,
+} = process.env;
+
+// Supabase eligibility webhook URL (defaults to production)
+const ELIGIBILITY_WEBHOOK_URL = SUPABASE_FUNCTION_URL || 
+  "https://nfoeswlppebvxaomfnsk.supabase.co/functions/v1/eligibility-complete";
 
 const DEBUG = String(DEBUG_ZOHO || "").toLowerCase() === "true";
 
@@ -360,6 +373,55 @@ async function createZohoErrorTask({
     });
   } catch (e) {
     console.error("[Zoho Task] failed:", String(e.message || e));
+  }
+}
+
+// -------------------------
+// Supabase eligibility webhook
+// -------------------------
+async function notifySupabaseEligibilityComplete(email) {
+  if (!SUPABASE_ELIGIBILITY_API_KEY) {
+    console.warn("[Supabase webhook] SUPABASE_ELIGIBILITY_API_KEY not configured - skipping webhook");
+    return { success: false, reason: "not_configured" };
+  }
+
+  if (!SUPABASE_ANON_KEY) {
+    console.warn("[Supabase webhook] SUPABASE_ANON_KEY not configured - skipping webhook");
+    return { success: false, reason: "anon_key_not_configured" };
+  }
+
+  if (!email) {
+    console.warn("[Supabase webhook] No email provided - skipping webhook");
+    return { success: false, reason: "no_email" };
+  }
+
+  try {
+    console.log(`[Supabase webhook] Notifying eligibility complete for: ${email}`);
+    
+    const response = await fetch(ELIGIBILITY_WEBHOOK_URL, {
+      method: "POST",
+      headers: { 
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${SUPABASE_ANON_KEY}`,
+      },
+      body: JSON.stringify({
+        email: email,
+        api_key: SUPABASE_ELIGIBILITY_API_KEY,
+      }),
+    });
+
+    const data = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      console.error(`[Supabase webhook] Failed with status ${response.status}:`, data);
+      return { success: false, reason: "request_failed", status: response.status, data };
+    }
+
+    console.log(`[Supabase webhook] Success:`, data);
+    return { success: true, data };
+  } catch (err) {
+    console.error("[Supabase webhook] Error:", err.message || err);
+    return { success: false, reason: "exception", error: err.message };
   }
 }
 
@@ -913,10 +975,17 @@ app.post("/api/submissions", async (req, res) => {
         });
       }
 
+      // Notify Supabase app to award bonus enhancements for complete submissions
+      let supabaseWebhookResult = null;
+      if (type === "complete" && email) {
+        supabaseWebhookResult = await notifySupabaseEligibilityComplete(email);
+      }
+
       return res.json({
         success: true,
         matched_by: matchedBy,
         removed_fields: upd.removed_fields || [],
+        supabase_webhook: supabaseWebhookResult,
       });
     }
 
@@ -928,11 +997,19 @@ app.post("/api/submissions", async (req, res) => {
     };
 
     const created = await createLeadWithRecovery(createPayload);
+
+    // Notify Supabase app to award bonus enhancements for complete submissions
+    let supabaseWebhookResult = null;
+    if (type === "complete" && email) {
+      supabaseWebhookResult = await notifySupabaseEligibilityComplete(email);
+    }
+
     return res.json({
       success: true,
       created: true,
       lead_id: created.id,
       removed_fields: created.removed_fields || [],
+      supabase_webhook: supabaseWebhookResult,
     });
   } catch (e) {
     const zohoErr = e?.zoho || null;
