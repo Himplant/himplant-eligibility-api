@@ -43,11 +43,11 @@ app.use(
 const ZOHO_ACCOUNTS = "https://accounts.zoho.com";
 const ZOHO_API_BASE = "https://www.zohoapis.com";
 
-const { 
-  ZOHO_CLIENT_ID, 
-  ZOHO_CLIENT_SECRET, 
-  ZOHO_REFRESH_TOKEN, 
-  CREATE_ZOHO_ERROR_TASKS, 
+const {
+  ZOHO_CLIENT_ID,
+  ZOHO_CLIENT_SECRET,
+  ZOHO_REFRESH_TOKEN,
+  CREATE_ZOHO_ERROR_TASKS,
   DEBUG_ZOHO,
   SUPABASE_ELIGIBILITY_API_KEY,
   SUPABASE_FUNCTION_URL,
@@ -55,8 +55,8 @@ const {
 } = process.env;
 
 // Supabase eligibility webhook URL (defaults to production)
-const ELIGIBILITY_WEBHOOK_URL = SUPABASE_FUNCTION_URL || 
-  "https://nfoeswlppebvxaomfnsk.supabase.co/functions/v1/eligibility-complete";
+const ELIGIBILITY_WEBHOOK_URL =
+  SUPABASE_FUNCTION_URL || "https://nfoeswlppebvxaomfnsk.supabase.co/functions/v1/eligibility-complete";
 
 const DEBUG = String(DEBUG_ZOHO || "").toLowerCase() === "true";
 
@@ -86,6 +86,9 @@ const FIELD_SURGEON_ALIAS = "Surgeon_Alias";
 // Lead fields you requested
 const FIELD_LEAD_EMBED_SOURCE_URL = "embed_source_url"; // exists in Leads per your confirmation
 const FIELD_LEAD_SURGEON_NAME = "Pick_Your_Surgeon"; // picklist; you confirmed alias matches allowed values
+
+// ✅ NEW: Preferred language picklist field (Lead)
+const FIELD_LEAD_PREFERRED_LANGUAGE = "Preferred_Language";
 
 // ✅ NEW: Medical conditions multiline field (Lead)
 const FIELD_LEAD_MEDICAL_CONDITION_LIST = "Medical_Condition_List";
@@ -127,6 +130,26 @@ function boolToYesNo(v) {
     if (s === "true") return "Yes";
     if (s === "false") return "No";
   }
+  return null;
+}
+
+/**
+ * ✅ Preferred language normalization:
+ * - Accepts exact Zoho picklist labels: "English" / "Spanish" / "Arabic"
+ * - Also tolerates: en/es/ar and lowercase labels
+ * - Returns one of: "English" | "Spanish" | "Arabic" | null
+ */
+function normalizePreferredLanguageForZoho(v) {
+  const s = String(v || "").trim();
+  if (!s) return null;
+
+  const lower = s.toLowerCase();
+  if (lower === "english" || lower === "en") return "English";
+  if (lower === "spanish" || lower === "es") return "Spanish";
+  if (lower === "arabic" || lower === "ar") return "Arabic";
+
+  // If you ever add more options in Zoho later, you can allow-pass-through here,
+  // but for now keep it strict to avoid INVALID_DATA rejections.
   return null;
 }
 
@@ -354,12 +377,7 @@ async function createZohoErrorTask({
 }) {
   if (!shouldCreateErrorTasks()) return;
 
-  const subjectBits = [
-    "Eligibility API Error",
-    submissionType ? `(${submissionType})` : "",
-    email ? `email:${email}` : "",
-    phoneE164 ? `phone:${phoneE164}` : "",
-  ].filter(Boolean);
+  const subjectBits = ["Eligibility API Error", submissionType ? `(${submissionType})` : "", email ? `email:${email}` : "", phoneE164 ? `phone:${phoneE164}` : ""].filter(Boolean);
 
   const subject = subjectBits.join(" ").trim() || "Eligibility API Error";
 
@@ -408,10 +426,10 @@ async function notifySupabaseEligibilityComplete(email) {
 
   try {
     console.log(`[Supabase webhook] Notifying eligibility complete for: ${email}`);
-    
+
     const response = await fetch(ELIGIBILITY_WEBHOOK_URL, {
       method: "POST",
-      headers: { 
+      headers: {
         "Content-Type": "application/json",
         "Authorization": `Bearer ${SUPABASE_ANON_KEY}`,
       },
@@ -514,8 +532,7 @@ app.get("/api/surgeons", async (req, res) => {
     if (!country) return res.status(400).json({ error: "country is required" });
     if (!city) return res.status(400).json({ error: "city is required" });
 
-    let criteria =
-      `(${FIELD_ACTIVE}:equals:true) and (${FIELD_COUNTRY}:equals:${country}) and (${FIELD_CITY}:equals:${city})`;
+    let criteria = `(${FIELD_ACTIVE}:equals:true) and (${FIELD_COUNTRY}:equals:${country}) and (${FIELD_CITY}:equals:${city})`;
     if (country === "United States" && state) {
       criteria =
         `(${FIELD_ACTIVE}:equals:true) and (${FIELD_COUNTRY}:equals:${country}) and ` +
@@ -668,6 +685,9 @@ function mapLeadBase(submission, surgeonAlias) {
     State: nullableText(getCurrentState(submission)),
     Session_ID: nullableText(submission.session_id),
 
+    // ✅ NEW: Preferred Language picklist
+    [FIELD_LEAD_PREFERRED_LANGUAGE]: normalizePreferredLanguageForZoho(submission.preferred_language),
+
     // Keep lookup mapping unchanged
     Surgeon_name_Lookup: nullableText(submission.surgeon_id),
 
@@ -694,6 +714,9 @@ function mapPartialBase(submission, surgeonAlias) {
     Session_ID: nullableText(submission.session_id),
     Date_of_Birth: nullableText(submission.date_of_birth),
 
+    // ✅ NEW: Preferred Language picklist
+    [FIELD_LEAD_PREFERRED_LANGUAGE]: normalizePreferredLanguageForZoho(submission.preferred_language),
+
     Surgeon_name_Lookup: nullableText(submission.surgeon_id),
 
     [FIELD_LEAD_EMBED_SOURCE_URL]: nullableText(submission.embed_source_url),
@@ -718,6 +741,9 @@ function mapCompleteBase(submission, surgeonAlias) {
     State: nullableText(getCurrentState(submission)),
 
     Session_ID: nullableText(submission.session_id),
+
+    // ✅ NEW: Preferred Language picklist
+    [FIELD_LEAD_PREFERRED_LANGUAGE]: normalizePreferredLanguageForZoho(submission.preferred_language),
 
     Surgeon_name_Lookup: nullableText(submission.surgeon_id),
 
@@ -973,17 +999,14 @@ app.post("/api/submissions", async (req, res) => {
 
       // Start both Zoho update and Supabase webhook in parallel for speed
       const zohoUpdatePromise = updateLeadWithRecovery(lead.id, payloadWithAppend);
-      
+
       let supabaseWebhookPromise = Promise.resolve(null);
       if (type === "complete" && email) {
         supabaseWebhookPromise = notifySupabaseEligibilityComplete(email);
       }
 
       // Wait for both to finish
-      const [upd, supabaseWebhookResult] = await Promise.all([
-        zohoUpdatePromise,
-        supabaseWebhookPromise
-      ]);
+      const [upd, supabaseWebhookResult] = await Promise.all([zohoUpdatePromise, supabaseWebhookPromise]);
 
       if ((upd.removed_fields || []).includes(FIELD_QUESTIONNAIRE_DETAILS)) {
         await createZohoErrorTask({
@@ -1015,17 +1038,14 @@ app.post("/api/submissions", async (req, res) => {
 
     // Start both Zoho creation and Supabase webhook in parallel for speed
     const zohoCreatePromise = createLeadWithRecovery(createPayload);
-    
+
     let supabaseWebhookPromiseNoLead = Promise.resolve(null);
     if (type === "complete" && email) {
       supabaseWebhookPromiseNoLead = notifySupabaseEligibilityComplete(email);
     }
 
     // Wait for both to finish
-    const [created, supabaseWebhookResultNoLead] = await Promise.all([
-      zohoCreatePromise,
-      supabaseWebhookPromiseNoLead
-    ]);
+    const [created, supabaseWebhookResultNoLead] = await Promise.all([zohoCreatePromise, supabaseWebhookPromiseNoLead]);
 
     return res.json({
       success: true,
