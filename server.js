@@ -63,8 +63,8 @@ const MODULE_TASKS = "Tasks";
 
 const FIELD_QUESTIONNAIRE_DETAILS = "Questionnaire_Details";
 const FIELD_QUESTIONNAIRE_DETAILS_2 = "Questionnaire_Details_2";
-const QUESTIONNAIRE_DETAILS_MAX_CHARS = 20000;
-const QUESTIONNAIRE_DETAILS_2_MAX_CHARS = 60000;
+const QUESTIONNAIRE_DETAILS_MAX_CHARS = 1800;
+const QUESTIONNAIRE_DETAILS_2_MAX_CHARS = 45000;
 
 const FIELD_ACTIVE = "Active_Status";
 const FIELD_COUNTRY = "Country";
@@ -113,6 +113,14 @@ function nullableText(v) {
   if (v === undefined || v === null) return null;
   const s = String(v).trim();
   return s === "" ? null : s;
+}
+
+function firstText(...values) {
+  for (const value of values) {
+    const s = nullableText(value);
+    if (s) return s;
+  }
+  return null;
 }
 
 function normalizeEmail(v) {
@@ -293,12 +301,18 @@ function deriveLeadSource(submission) {
   return explicit;
 }
 
-function normalizeDateTime(v) {
-  const s = String(v || "").trim();
-  if (!s) return null;
-  const d = new Date(s);
-  if (Number.isNaN(d.getTime())) return null;
-  return d.toISOString();
+function getOutcomeValue(submission) {
+  return firstText(
+    submission.outcome,
+    submission.eligibility_outcome,
+    submission.eligibility_result,
+    submission.result,
+    submission.eligibility
+  );
+}
+
+function getEligibilityValue(submission) {
+  return firstText(submission.eligibility, submission.eligibility_outcome, submission.outcome, submission.result);
 }
 
 const ZOHO_TRIGGER = ["workflow", "blueprint"];
@@ -565,7 +579,7 @@ async function findLeadForQuestionnaire({ sessionId }) {
   return { lead: null, matchedBy: "none" };
 }
 
-function buildEntryString(submission, type, extra = {}) {
+function buildFullEntryString(submission, type, extra = {}) {
   const ts = new Date().toISOString();
   const header =
     `===== ${ts} | submission_type=${type || ""}` +
@@ -576,6 +590,24 @@ function buildEntryString(submission, type, extra = {}) {
   return header + safeJsonStringify(submission, QUESTIONNAIRE_DETAILS_2_MAX_CHARS) + "\n\n";
 }
 
+function buildSummaryEntryString(submission, type, extra = {}) {
+  const ts = new Date().toISOString();
+  const lines = [
+    `===== ${ts} | submission_type=${type || ""} =====`,
+    extra.sessionId ? `session_id=${extra.sessionId}` : null,
+    extra.email ? `email=${extra.email}` : null,
+    extra.phone ? `phone=${extra.phone}` : null,
+    `outcome=${getOutcomeValue(submission) || ""}`,
+    `eligibility=${getEligibilityValue(submission) || ""}`,
+    `surgeon=${submission.surgeon_name || submission.surgeon_id || ""}`,
+    `location=${[getCurrentCity(submission), getCurrentState(submission), getCurrentCountry(submission)].filter(Boolean).join(", ")}`,
+    `language=${submission.preferred_language || ""}`,
+    `source=${submission.lead_source || ""}`,
+  ].filter(Boolean);
+
+  return lines.join("\n") + "\n\n";
+}
+
 function clampToMaxCharsKeepNewest(text, maxChars) {
   const s = String(text || "");
   if (s.length <= maxChars) return s;
@@ -583,7 +615,8 @@ function clampToMaxCharsKeepNewest(text, maxChars) {
 }
 
 async function appendQuestionnaireDetailsToExistingLead(leadId, payload, submission, type, ctx) {
-  const newEntry = buildEntryString(submission, type, ctx);
+  const newSummaryEntry = buildSummaryEntryString(submission, type, ctx);
+  const newFullEntry = buildFullEntryString(submission, type, ctx);
   let existingSmall = "";
   let existingLarge = "";
   try {
@@ -591,8 +624,8 @@ async function appendQuestionnaireDetailsToExistingLead(leadId, payload, submiss
     existingSmall = String(lead?.[FIELD_QUESTIONNAIRE_DETAILS] || "");
     existingLarge = String(lead?.[FIELD_QUESTIONNAIRE_DETAILS_2] || "");
   } catch {}
-  const combinedSmall = existingSmall ? existingSmall + "\n" + newEntry : newEntry;
-  const combinedLarge = existingLarge ? existingLarge + "\n" + newEntry : newEntry;
+  const combinedSmall = existingSmall ? existingSmall + "\n" + newSummaryEntry : newSummaryEntry;
+  const combinedLarge = existingLarge ? existingLarge + "\n" + newFullEntry : newFullEntry;
   return {
     ...payload,
     [FIELD_QUESTIONNAIRE_DETAILS]: clampToMaxCharsKeepNewest(combinedSmall, QUESTIONNAIRE_DETAILS_MAX_CHARS),
@@ -616,7 +649,6 @@ function mapAttribution(submission) {
     utm_term: nullableText(submission.utm_term),
     [FIELD_LEAD_EMBED_SOURCE_URL]: normalizeUrl(submission.embed_source_url),
     Landing_Page_URL: normalizeUrl(submission.landing_page_url || submission.embed_source_url),
-    Submitted_At: normalizeDateTime(submission.submitted_at) || new Date().toISOString(),
     Idempotency_Key: nullableText(submission.idempotency_key),
   });
 }
@@ -655,6 +687,10 @@ function mapPartialBase(submission, surgeonAlias) {
   return pruneEmpty({
     ...mapCommonBase(submission, surgeonAlias, { includeIdentity: false }),
     Date_of_Birth: nullableText(submission.date_of_birth),
+    Eligibility: getEligibilityValue(submission),
+    Outcome: getOutcomeValue(submission),
+    Eligibility_Flags: toMultilineText(submission.eligibility_flags || submission.flags),
+    Eligibility_Reasons: toMultilineText(submission.eligibility_reasons || submission.reasons),
   });
 }
 
@@ -680,8 +716,8 @@ function mapCompleteBase(submission, surgeonAlias) {
         : boolToYesNo(submission.recent_outbreak_6mo),
     [FIELD_LEAD_MEDICAL_CONDITION_LIST]: toMultilineText(submission.medical_conditions_list),
     Body_Type: nullableText(submission.body_type),
-    Eligibility: nullableText(submission.eligibility),
-    Outcome: nullableText(submission.outcome),
+    Eligibility: getEligibilityValue(submission),
+    Outcome: getOutcomeValue(submission),
     Eligibility_Flags: toMultilineText(submission.eligibility_flags || submission.flags),
     Eligibility_Reasons: toMultilineText(submission.eligibility_reasons || submission.reasons),
   });
@@ -950,11 +986,12 @@ app.post("/api/submissions", async (req, res) => {
           };
         }
 
-        const initialEntry = buildEntryString(submission, type, { sessionId, email, phone: phoneE164 });
+        const initialSummaryEntry = buildSummaryEntryString(submission, type, { sessionId, email, phone: phoneE164 });
+        const initialFullEntry = buildFullEntryString(submission, type, { sessionId, email, phone: phoneE164 });
         const createPayload = {
           ...payloadBase,
-          [FIELD_QUESTIONNAIRE_DETAILS]: clampToMaxCharsKeepNewest(initialEntry, QUESTIONNAIRE_DETAILS_MAX_CHARS),
-          [FIELD_QUESTIONNAIRE_DETAILS_2]: clampToMaxCharsKeepNewest(initialEntry, QUESTIONNAIRE_DETAILS_2_MAX_CHARS),
+          [FIELD_QUESTIONNAIRE_DETAILS]: clampToMaxCharsKeepNewest(initialSummaryEntry, QUESTIONNAIRE_DETAILS_MAX_CHARS),
+          [FIELD_QUESTIONNAIRE_DETAILS_2]: clampToMaxCharsKeepNewest(initialFullEntry, QUESTIONNAIRE_DETAILS_2_MAX_CHARS),
         };
 
         try {
