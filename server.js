@@ -10,11 +10,11 @@ const ALLOWED_ORIGINS = [
   "https://eligibility.himplant.com",
   "https://himplant.com",
   "https://www.himplant.com",
+  "https://get.himplant.com",
   "https://lovableproject.com",
   "https://lovable.dev",
   "https://bc248be2-fa03-4ded-a845-6db79ac12fb7.lovableproject.com",
   "https://himplanteligibility.lovable.app",
-  // TEMPORARY: Local development origins - REMOVE BEFORE DEPLOYING
   "http://localhost:8080",
   "http://localhost:3000",
   "http://localhost:5173",
@@ -25,10 +25,9 @@ const ALLOWED_ORIGINS = [
 
 app.use(
   cors({
-    origin: function (origin, callback) {
+    origin(origin, callback) {
       if (!origin) return callback(null, true);
       if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
-      // TEMPORARY: Allow any localhost origin for local testing - REMOVE BEFORE DEPLOYING
       if (origin.startsWith("http://localhost:") || origin.startsWith("http://127.0.0.1:")) {
         return callback(null, true);
       }
@@ -39,7 +38,6 @@ app.use(
   })
 );
 
-// Zoho US endpoints
 const ZOHO_ACCOUNTS = "https://accounts.zoho.com";
 const ZOHO_API_BASE = "https://www.zohoapis.com";
 
@@ -54,7 +52,6 @@ const {
   SUPABASE_ANON_KEY,
 } = process.env;
 
-// Supabase eligibility webhook URL (defaults to production)
 const ELIGIBILITY_WEBHOOK_URL =
   SUPABASE_FUNCTION_URL || "https://nfoeswlppebvxaomfnsk.supabase.co/functions/v1/eligibility-complete";
 
@@ -65,11 +62,10 @@ const MODULE_LEADS = "Leads";
 const MODULE_TASKS = "Tasks";
 
 const FIELD_QUESTIONNAIRE_DETAILS = "Questionnaire_Details";
-
-// Keep this smaller to reduce Zoho rejecting it
+const FIELD_QUESTIONNAIRE_DETAILS_2 = "Questionnaire_Details_2";
 const QUESTIONNAIRE_DETAILS_MAX_CHARS = 20000;
+const QUESTIONNAIRE_DETAILS_2_MAX_CHARS = 60000;
 
-// Surgeons fields (Zoho API names)
 const FIELD_ACTIVE = "Active_Status";
 const FIELD_COUNTRY = "Country";
 const FIELD_STATE = "State";
@@ -79,19 +75,17 @@ const FIELD_PRICE = "Surgery_Price";
 const FIELD_BOOK_EN = "Consult_Booking_EN";
 const FIELD_BOOK_ES = "Consult_Booking_ES";
 const FIELD_BOOK_AR = "Consult_Booking_AR";
-
-// Surgeon Alias field (Surgeons module)
 const FIELD_SURGEON_ALIAS = "Surgeon_Alias";
 
-// Lead fields you requested
-const FIELD_LEAD_EMBED_SOURCE_URL = "embed_source_url"; // exists in Leads per your confirmation
-const FIELD_LEAD_SURGEON_NAME = "Pick_Your_Surgeon"; // picklist; you confirmed alias matches allowed values
-
-// ✅ NEW: Preferred language picklist field (Lead)
+const FIELD_LEAD_EMBED_SOURCE_URL = "embed_source_url";
+const FIELD_LEAD_SURGEON_NAME = "Pick_Your_Surgeon";
 const FIELD_LEAD_PREFERRED_LANGUAGE = "Preferred_Language";
-
-// ✅ NEW: Medical conditions multiline field (Lead)
 const FIELD_LEAD_MEDICAL_CONDITION_LIST = "Medical_Condition_List";
+
+const inFlightSubmissions = new Map();
+const recentSubmissionResults = new Map();
+const IN_FLIGHT_TTL_MS = 15_000;
+const RECENT_RESULT_TTL_MS = 20_000;
 
 let cachedAccessToken = null;
 let tokenExpiresAt = 0;
@@ -106,9 +100,10 @@ function digitsOnly(s) {
 
 function pruneEmpty(obj) {
   const out = {};
-  for (const [k, v] of Object.entries(obj)) {
+  for (const [k, v] of Object.entries(obj || {})) {
     if (v === undefined || v === null) continue;
     if (typeof v === "string" && v.trim() === "") continue;
+    if (Array.isArray(v) && v.length === 0) continue;
     out[k] = v;
   }
   return out;
@@ -120,51 +115,42 @@ function nullableText(v) {
   return s === "" ? null : s;
 }
 
+function normalizeEmail(v) {
+  const s = String(v || "").trim().toLowerCase();
+  if (!s) return "";
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s) ? s : "";
+}
+
 function boolToYesNo(v) {
   if (v === true) return "Yes";
   if (v === false) return "No";
   if (typeof v === "string") {
     const s = v.trim().toLowerCase();
-    if (s === "yes") return "Yes";
-    if (s === "no") return "No";
-    if (s === "true") return "Yes";
-    if (s === "false") return "No";
+    if (["yes", "true", "1"].includes(s)) return "Yes";
+    if (["no", "false", "0"].includes(s)) return "No";
   }
   return null;
 }
 
-/**
- * ✅ Preferred language normalization:
- * - Accepts exact Zoho picklist labels: "English" / "Spanish" / "Arabic"
- * - Also tolerates: en/es/ar and lowercase labels
- * - Returns one of: "English" | "Spanish" | "Arabic" | null
- */
 function normalizePreferredLanguageForZoho(v) {
   const s = String(v || "").trim();
   if (!s) return null;
-
   const lower = s.toLowerCase();
   if (lower === "english" || lower === "en") return "English";
   if (lower === "spanish" || lower === "es") return "Spanish";
   if (lower === "arabic" || lower === "ar") return "Arabic";
-
-  // If you ever add more options in Zoho later, you can allow-pass-through here,
-  // but for now keep it strict to avoid INVALID_DATA rejections.
   return null;
 }
 
 function toZohoJsonArray(value) {
   if (value === undefined || value === null) return null;
-
   if (Array.isArray(value)) {
     const clean = value.map((x) => String(x || "").trim()).filter(Boolean);
     return clean.length ? clean : null;
   }
-
   if (typeof value === "string") {
     const s = value.trim();
     if (!s) return null;
-
     if (s.startsWith("[") && s.endsWith("]")) {
       try {
         const parsed = JSON.parse(s);
@@ -174,33 +160,27 @@ function toZohoJsonArray(value) {
         }
       } catch {}
     }
-
     const parts = s.split(",").map((x) => x.trim()).filter(Boolean);
     return parts.length ? parts : null;
   }
-
   const s = String(value).trim();
   return s ? [s] : null;
 }
 
 function toMultilineText(value) {
   if (value === undefined || value === null) return null;
-
   if (typeof value === "string") {
     const s = value.trim();
     return s ? s : null;
   }
-
   if (Array.isArray(value)) {
     const lines = value.map((x) => String(x || "").trim()).filter(Boolean);
     return lines.length ? lines.join("\n") : null;
   }
-
   const s = String(value).trim();
   return s ? s : null;
 }
 
-// Phone normalization to E.164
 const ISO_TO_DIAL = {
   US: "1",
   CA: "1",
@@ -226,17 +206,13 @@ const ISO_TO_DIAL = {
 
 function normalizePhoneE164(countryCodeOrDial, phoneNumber) {
   const raw = String(phoneNumber || "").trim();
-
   if (raw.startsWith("+")) {
     const cleaned = "+" + digitsOnly(raw);
     return cleaned.length > 1 ? cleaned : "";
   }
-
   const pn = digitsOnly(raw);
   const ccRaw = String(countryCodeOrDial || "").trim().toUpperCase();
-
   const dial = ISO_TO_DIAL[ccRaw] || (digitsOnly(ccRaw) ? digitsOnly(ccRaw) : "");
-
   if (!dial && !pn) return "";
   if (!dial) return pn ? `+${pn}` : "";
   return pn ? `+${dial}${pn}` : `+${dial}`;
@@ -248,6 +224,10 @@ function getCurrentCountry(submission) {
 
 function getCurrentState(submission) {
   return submission.current_location_state || submission.location_state || submission.state || "";
+}
+
+function getCurrentCity(submission) {
+  return submission.current_location_city || submission.location_city || submission.city || "";
 }
 
 function pickBookingUrl(record, lang) {
@@ -277,34 +257,69 @@ function shouldCreateErrorTasks() {
   return String(CREATE_ZOHO_ERROR_TASKS).toLowerCase() === "true";
 }
 
-// Force Zoho automations to run
+function normalizeUrl(v) {
+  const s = String(v || "").trim();
+  return s || null;
+}
+
+function deriveLeadSource(submission) {
+  const explicit = nullableText(submission.lead_source);
+  const signals = [
+    submission.gclid,
+    submission.gclid2,
+    submission.gbraid,
+    submission.wbraid,
+    submission.gad_source,
+    submission.utm_source,
+    submission.embed_source_url,
+    submission.landing_page_url,
+    submission.referrer,
+  ]
+    .map((x) => String(x || "").toLowerCase())
+    .join(" ");
+
+  if (
+    submission.gclid ||
+    submission.gclid2 ||
+    submission.gbraid ||
+    submission.wbraid ||
+    submission.gad_source ||
+    signals.includes("get.himplant.com") ||
+    signals.includes("google")
+  ) {
+    return "Google Ads";
+  }
+
+  return explicit;
+}
+
+function normalizeDateTime(v) {
+  const s = String(v || "").trim();
+  if (!s) return null;
+  const d = new Date(s);
+  if (Number.isNaN(d.getTime())) return null;
+  return d.toISOString();
+}
+
 const ZOHO_TRIGGER = ["workflow", "blueprint"];
 
-// -------------------------
-// Zoho auth + requests
-// -------------------------
 async function getAccessToken() {
   const now = Date.now();
   if (cachedAccessToken && now < tokenExpiresAt - 60_000) return cachedAccessToken;
-
   if (!ZOHO_CLIENT_ID || !ZOHO_CLIENT_SECRET || !ZOHO_REFRESH_TOKEN) {
     throw new Error("Missing Zoho env vars");
   }
-
   const params = new URLSearchParams({
     refresh_token: ZOHO_REFRESH_TOKEN,
     client_id: ZOHO_CLIENT_ID,
     client_secret: ZOHO_CLIENT_SECRET,
     grant_type: "refresh_token",
   });
-
   const res = await fetch(`${ZOHO_ACCOUNTS}/oauth/v2/token?${params.toString()}`, { method: "POST" });
-
   const data = await res.json().catch(() => ({}));
   if (!res.ok || !data.access_token) {
     throw new Error(`Zoho token refresh failed: ${JSON.stringify(data)}`);
   }
-
   cachedAccessToken = data.access_token;
   tokenExpiresAt = Date.now() + (data.expires_in || 3600) * 1000;
   return cachedAccessToken;
@@ -320,7 +335,6 @@ async function zohoRequest(method, path, body) {
     },
     body: body ? JSON.stringify(body) : undefined,
   });
-
   const text = await res.text();
   let data;
   try {
@@ -328,14 +342,12 @@ async function zohoRequest(method, path, body) {
   } catch {
     data = { raw: text };
   }
-
   if (!res.ok) {
     const err = new Error(`Zoho API error ${res.status}`);
     err.zoho = data;
     err.httpStatus = res.status;
     throw err;
   }
-
   return data;
 }
 
@@ -343,18 +355,13 @@ const zohoGET = (path) => zohoRequest("GET", path);
 const zohoPOST = (path, body) => zohoRequest("POST", path, body);
 const zohoPUT = (path, body) => zohoRequest("PUT", path, body);
 
-// -------------------------
-// Surgeon alias fetch (authoritative from Zoho Surgeons module)
-// -------------------------
 async function fetchSurgeonAlias(surgeonId) {
   const id = String(surgeonId || "").trim();
   if (!id) return null;
-
   try {
     const record = await zohoGET(`/crm/v2/${MODULE_SURGEONS}/${id}`);
     const s = record?.data?.[0];
     if (!s) return null;
-
     const alias = String(s?.[FIELD_SURGEON_ALIAS] || "").trim();
     return alias || null;
   } catch {
@@ -362,114 +369,62 @@ async function fetchSurgeonAlias(surgeonId) {
   }
 }
 
-// -------------------------
-// Error Task
-// -------------------------
-async function createZohoErrorTask({
-  leadId,
-  submissionType,
-  sessionId,
-  email,
-  phoneE164,
-  errorMessage,
-  zohoDetails,
-  submissionPayload,
-}) {
+async function createZohoErrorTask({ leadId, submissionType, sessionId, email, phoneE164, errorMessage, zohoDetails, submissionPayload }) {
   if (!shouldCreateErrorTasks()) return;
-
-  const subjectBits = ["Eligibility API Error", submissionType ? `(${submissionType})` : "", email ? `email:${email}` : "", phoneE164 ? `phone:${phoneE164}` : ""].filter(Boolean);
-
-  const subject = subjectBits.join(" ").trim() || "Eligibility API Error";
-
+  const subjectBits = [
+    "Eligibility API Error",
+    submissionType ? `(${submissionType})` : "",
+    email ? `email:${email}` : "",
+    phoneE164 ? `phone:${phoneE164}` : "",
+  ].filter(Boolean);
   const description =
     `Error Message:\n${errorMessage || "(none)"}\n\n` +
     `Zoho Details:\n${safeJsonStringify(zohoDetails || {}, 8000)}\n\n` +
     `Context:\nsession_id=${sessionId || ""}\nemail=${email || ""}\nphone=${phoneE164 || ""}\n\n` +
     `Payload:\n${safeJsonStringify(submissionPayload || {}, 28000)}`;
-
   const taskRecord = pruneEmpty({
-    Subject: subject,
+    Subject: subjectBits.join(" ").trim() || "Eligibility API Error",
     Status: "Backlogged",
     Due_Date: todayYYYYMMDD(),
     Description: description,
     Who_Id: leadId || null,
   });
-
   try {
-    await zohoPOST(`/crm/v2/${MODULE_TASKS}`, {
-      trigger: ZOHO_TRIGGER,
-      data: [taskRecord],
-    });
+    await zohoPOST(`/crm/v2/${MODULE_TASKS}`, { trigger: ZOHO_TRIGGER, data: [taskRecord] });
   } catch (e) {
     console.error("[Zoho Task] failed:", String(e.message || e));
   }
 }
 
-// -------------------------
-// Supabase eligibility webhook
-// -------------------------
 async function notifySupabaseEligibilityComplete(email) {
-  if (!SUPABASE_ELIGIBILITY_API_KEY) {
-    console.warn("[Supabase webhook] SUPABASE_ELIGIBILITY_API_KEY not configured - skipping webhook");
-    return { success: false, reason: "not_configured" };
-  }
-
-  if (!SUPABASE_ANON_KEY) {
-    console.warn("[Supabase webhook] SUPABASE_ANON_KEY not configured - skipping webhook");
-    return { success: false, reason: "anon_key_not_configured" };
-  }
-
-  if (!email) {
-    console.warn("[Supabase webhook] No email provided - skipping webhook");
-    return { success: false, reason: "no_email" };
-  }
-
+  if (!SUPABASE_ELIGIBILITY_API_KEY) return { success: false, reason: "not_configured" };
+  if (!SUPABASE_ANON_KEY) return { success: false, reason: "anon_key_not_configured" };
+  if (!email) return { success: false, reason: "no_email" };
   try {
-    console.log(`[Supabase webhook] Notifying eligibility complete for: ${email}`);
-
     const response = await fetch(ELIGIBILITY_WEBHOOK_URL, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Authorization": `Bearer ${SUPABASE_ANON_KEY}`,
+        Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
       },
-      body: JSON.stringify({
-        email: email,
-        api_key: SUPABASE_ELIGIBILITY_API_KEY,
-      }),
+      body: JSON.stringify({ email, api_key: SUPABASE_ELIGIBILITY_API_KEY }),
     });
-
     const data = await response.json().catch(() => ({}));
-
-    if (!response.ok) {
-      console.error(`[Supabase webhook] Failed with status ${response.status}:`, data);
-      return { success: false, reason: "request_failed", status: response.status, data };
-    }
-
-    console.log(`[Supabase webhook] Success:`, data);
+    if (!response.ok) return { success: false, reason: "request_failed", status: response.status, data };
     return { success: true, data };
   } catch (err) {
-    console.error("[Supabase webhook] Error:", err.message || err);
     return { success: false, reason: "exception", error: err.message };
   }
 }
 
-// -------------------------
-// Health
-// -------------------------
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-// -------------------------
-// Surgeons endpoints
-// -------------------------
 app.get("/api/geo/countries", async (req, res) => {
   try {
-    const criteria = `(${FIELD_ACTIVE}:equals:true)`;
-    const data = await zohoGET(`/crm/v2/${MODULE_SURGEONS}/search?criteria=${encodeURIComponent(criteria)}`);
-
+    const data = await zohoGET(`/crm/v2/${MODULE_SURGEONS}/search?criteria=${encodeURIComponent(`(${FIELD_ACTIVE}:equals:true)`)}`);
     const countries = new Set();
     for (const r of data?.data || []) {
-      const c = (r?.[FIELD_COUNTRY] || "").toString().trim();
+      const c = String(r?.[FIELD_COUNTRY] || "").trim();
       if (c) countries.add(c);
     }
     res.json(Array.from(countries).sort((a, b) => a.localeCompare(b)));
@@ -480,16 +435,14 @@ app.get("/api/geo/countries", async (req, res) => {
 
 app.get("/api/geo/states", async (req, res) => {
   try {
-    const country = (req.query.country || "").toString().trim();
+    const country = String(req.query.country || "").trim();
     if (!country) return res.status(400).json({ error: "country is required" });
     if (country !== "United States") return res.json([]);
-
     const criteria = `(${FIELD_ACTIVE}:equals:true) and (${FIELD_COUNTRY}:equals:${country})`;
     const data = await zohoGET(`/crm/v2/${MODULE_SURGEONS}/search?criteria=${encodeURIComponent(criteria)}`);
-
     const states = new Set();
     for (const r of data?.data || []) {
-      const st = (r?.[FIELD_STATE] || "").toString().trim();
+      const st = String(r?.[FIELD_STATE] || "").trim();
       if (st) states.add(st);
     }
     res.json(Array.from(states).sort((a, b) => a.localeCompare(b)));
@@ -500,20 +453,17 @@ app.get("/api/geo/states", async (req, res) => {
 
 app.get("/api/geo/cities", async (req, res) => {
   try {
-    const country = (req.query.country || "").toString().trim();
-    const state = (req.query.state || "").toString().trim();
+    const country = String(req.query.country || "").trim();
+    const state = String(req.query.state || "").trim();
     if (!country) return res.status(400).json({ error: "country is required" });
-
     let criteria = `(${FIELD_ACTIVE}:equals:true) and (${FIELD_COUNTRY}:equals:${country})`;
     if (country === "United States" && state) {
       criteria = `(${FIELD_ACTIVE}:equals:true) and (${FIELD_COUNTRY}:equals:${country}) and (${FIELD_STATE}:equals:${state})`;
     }
-
     const data = await zohoGET(`/crm/v2/${MODULE_SURGEONS}/search?criteria=${encodeURIComponent(criteria)}`);
-
     const cities = new Set();
     for (const r of data?.data || []) {
-      const city = (r?.[FIELD_CITY] || "").toString().trim();
+      const city = String(r?.[FIELD_CITY] || "").trim();
       if (city) cities.add(city);
     }
     res.json(Array.from(cities).sort((a, b) => a.localeCompare(b)));
@@ -524,23 +474,17 @@ app.get("/api/geo/cities", async (req, res) => {
 
 app.get("/api/surgeons", async (req, res) => {
   try {
-    const country = (req.query.country || "").toString().trim();
-    const state = (req.query.state || "").toString().trim();
-    const city = (req.query.city || "").toString().trim();
-    const lang = (req.query.lang || "en").toString().trim().toLowerCase();
-
+    const country = String(req.query.country || "").trim();
+    const state = String(req.query.state || "").trim();
+    const city = String(req.query.city || "").trim();
+    const lang = String(req.query.lang || "en").trim().toLowerCase();
     if (!country) return res.status(400).json({ error: "country is required" });
     if (!city) return res.status(400).json({ error: "city is required" });
-
     let criteria = `(${FIELD_ACTIVE}:equals:true) and (${FIELD_COUNTRY}:equals:${country}) and (${FIELD_CITY}:equals:${city})`;
     if (country === "United States" && state) {
-      criteria =
-        `(${FIELD_ACTIVE}:equals:true) and (${FIELD_COUNTRY}:equals:${country}) and ` +
-        `(${FIELD_STATE}:equals:${state}) and (${FIELD_CITY}:equals:${city})`;
+      criteria = `(${FIELD_ACTIVE}:equals:true) and (${FIELD_COUNTRY}:equals:${country}) and (${FIELD_STATE}:equals:${state}) and (${FIELD_CITY}:equals:${city})`;
     }
-
     const data = await zohoGET(`/crm/v2/${MODULE_SURGEONS}/search?criteria=${encodeURIComponent(criteria)}`);
-
     const surgeons = (data?.data || []).map((r) => {
       const bookingUrl = pickBookingUrl(r, lang);
       return {
@@ -551,7 +495,6 @@ app.get("/api/surgeons", async (req, res) => {
         bookingUrl: bookingUrl || null,
       };
     });
-
     res.json(surgeons);
   } catch {
     res.status(500).json({ error: "surgeons lookup failed" });
@@ -560,43 +503,30 @@ app.get("/api/surgeons", async (req, res) => {
 
 app.get("/api/surgeons/:id", async (req, res) => {
   try {
-    const surgeonId = (req.params.id || "").toString().trim();
-    const lang = (req.query.lang || "en").toString().trim().toLowerCase();
+    const surgeonId = String(req.params.id || "").trim();
+    const lang = String(req.query.lang || "en").trim().toLowerCase();
     if (!surgeonId) return res.status(400).json({ error: "surgeonId required" });
-
     const record = await zohoGET(`/crm/v2/${MODULE_SURGEONS}/${surgeonId}`);
     const s = record?.data?.[0];
     if (!s) return res.status(404).json({ error: "surgeon not found" });
-
     const bookingUrl = pickBookingUrl(s, lang);
-
-    res.json({
-      id: surgeonId,
-      name: s[FIELD_NAME] || "",
-      price: s[FIELD_PRICE] ?? null,
-      bookingUrl: bookingUrl || null,
-    });
+    res.json({ id: surgeonId, name: s[FIELD_NAME] || "", price: s[FIELD_PRICE] ?? null, bookingUrl: bookingUrl || null });
   } catch {
     res.status(500).json({ error: "surgeon lookup failed" });
   }
 });
 
-// -------------------------
-// Lead search helpers
-// -------------------------
 async function searchLeadByEmail(email) {
-  const e = String(email || "").trim();
+  const e = normalizeEmail(email);
   if (!e) return null;
-  const criteria = `(Email:equals:${e})`;
-  const data = await zohoGET(`/crm/v2/${MODULE_LEADS}/search?criteria=${encodeURIComponent(criteria)}`);
+  const data = await zohoGET(`/crm/v2/${MODULE_LEADS}/search?criteria=${encodeURIComponent(`(Email:equals:${e})`)}`);
   return (data?.data || [])[0] || null;
 }
 
 async function searchLeadBySessionId(sessionId) {
   const s = String(sessionId || "").trim();
   if (!s) return null;
-  const criteria = `(Session_ID:equals:${s})`;
-  const data = await zohoGET(`/crm/v2/${MODULE_LEADS}/search?criteria=${encodeURIComponent(criteria)}`);
+  const data = await zohoGET(`/crm/v2/${MODULE_LEADS}/search?criteria=${encodeURIComponent(`(Session_ID:equals:${s})`)}`);
   return (data?.data || [])[0] || null;
 }
 
@@ -613,8 +543,11 @@ async function getLeadByIdForAppend(leadId) {
   return record?.data?.[0] || null;
 }
 
-// KEEP PRIORITY: Email -> Phone -> Session ID
-async function findLeadByPriority({ email, phoneE164, sessionId }) {
+async function findLeadForInitialLead({ sessionId, email, phoneE164 }) {
+  if (sessionId) {
+    const bySession = await searchLeadBySessionId(sessionId);
+    if (bySession?.id) return { lead: bySession, matchedBy: "session" };
+  }
   if (email) {
     const byEmail = await searchLeadByEmail(email);
     if (byEmail?.id) return { lead: byEmail, matchedBy: "email" };
@@ -623,16 +556,15 @@ async function findLeadByPriority({ email, phoneE164, sessionId }) {
     const byPhone = await searchLeadByPhoneE164(phoneE164);
     if (byPhone?.id) return { lead: byPhone, matchedBy: "phone" };
   }
-  if (sessionId) {
-    const bySession = await searchLeadBySessionId(sessionId);
-    if (bySession?.id) return { lead: bySession, matchedBy: "session" };
-  }
   return { lead: null, matchedBy: "none" };
 }
 
-// -------------------------
-// Questionnaire_Details append
-// -------------------------
+async function findLeadForQuestionnaire({ sessionId }) {
+  const bySession = await searchLeadBySessionId(sessionId);
+  if (bySession?.id) return { lead: bySession, matchedBy: "session" };
+  return { lead: null, matchedBy: "none" };
+}
+
 function buildEntryString(submission, type, extra = {}) {
   const ts = new Date().toISOString();
   const header =
@@ -641,8 +573,7 @@ function buildEntryString(submission, type, extra = {}) {
     (extra.email ? ` | email=${extra.email}` : "") +
     (extra.phone ? ` | phone=${extra.phone}` : "") +
     ` =====\n`;
-
-  return header + safeJsonStringify(submission, QUESTIONNAIRE_DETAILS_MAX_CHARS) + "\n\n";
+  return header + safeJsonStringify(submission, QUESTIONNAIRE_DETAILS_2_MAX_CHARS) + "\n\n";
 }
 
 function clampToMaxCharsKeepNewest(text, maxChars) {
@@ -653,145 +584,111 @@ function clampToMaxCharsKeepNewest(text, maxChars) {
 
 async function appendQuestionnaireDetailsToExistingLead(leadId, payload, submission, type, ctx) {
   const newEntry = buildEntryString(submission, type, ctx);
-
-  let existing = "";
+  let existingSmall = "";
+  let existingLarge = "";
   try {
     const lead = await getLeadByIdForAppend(leadId);
-    existing = String(lead?.[FIELD_QUESTIONNAIRE_DETAILS] || "");
-  } catch {
-    existing = "";
-  }
-
-  const combined = existing ? existing + "\n" + newEntry : newEntry;
-
+    existingSmall = String(lead?.[FIELD_QUESTIONNAIRE_DETAILS] || "");
+    existingLarge = String(lead?.[FIELD_QUESTIONNAIRE_DETAILS_2] || "");
+  } catch {}
+  const combinedSmall = existingSmall ? existingSmall + "\n" + newEntry : newEntry;
+  const combinedLarge = existingLarge ? existingLarge + "\n" + newEntry : newEntry;
   return {
     ...payload,
-    [FIELD_QUESTIONNAIRE_DETAILS]: clampToMaxCharsKeepNewest(combined, QUESTIONNAIRE_DETAILS_MAX_CHARS),
+    [FIELD_QUESTIONNAIRE_DETAILS]: clampToMaxCharsKeepNewest(combinedSmall, QUESTIONNAIRE_DETAILS_MAX_CHARS),
+    [FIELD_QUESTIONNAIRE_DETAILS_2]: clampToMaxCharsKeepNewest(combinedLarge, QUESTIONNAIRE_DETAILS_2_MAX_CHARS),
   };
 }
 
-// -------------------------
-// Mapping to Zoho
-// -------------------------
-function mapLeadBase(submission, surgeonAlias) {
-  const phone = normalizePhoneE164(submission.phone_country_code, submission.phone_number);
+function mapAttribution(submission) {
   return pruneEmpty({
-    First_Name: nullableText(submission.first_name),
-    Last_Name: nullableText(submission.last_name),
-    Email: nullableText(submission.email),
-    Phone: phone || null,
-    Mobile: phone || null,
-    Country: nullableText(getCurrentCountry(submission)),
-    State: nullableText(getCurrentState(submission)),
-    Session_ID: nullableText(submission.session_id),
-
-    // ✅ NEW: Preferred Language picklist
-    [FIELD_LEAD_PREFERRED_LANGUAGE]: normalizePreferredLanguageForZoho(submission.preferred_language),
-
-    // Keep lookup mapping unchanged
-    Surgeon_name_Lookup: nullableText(submission.surgeon_id),
-
-    // Lead embed_source_url field
-    [FIELD_LEAD_EMBED_SOURCE_URL]: nullableText(submission.embed_source_url),
-
-    // Alias to picklist
-    [FIELD_LEAD_SURGEON_NAME]: nullableText(surgeonAlias),
-
-    Intake_Date: nullableText(submission.submitted_at) || new Date().toISOString(),
+    Lead_Source: deriveLeadSource(submission),
+    gclid2: nullableText(submission.gclid || submission.gclid2),
+    GBRAID: nullableText(submission.gbraid),
+    WBRAID: nullableText(submission.wbraid),
+    FBCLID: nullableText(submission.fbclid),
+    MSCLKID: nullableText(submission.msclkid),
+    Gad_Source: nullableText(submission.gad_source),
+    utm_source: nullableText(submission.utm_source),
+    utm_medium: nullableText(submission.utm_medium),
+    utm_campaign: nullableText(submission.utm_campaign),
+    utm_content: nullableText(submission.utm_content),
+    utm_term: nullableText(submission.utm_term),
+    [FIELD_LEAD_EMBED_SOURCE_URL]: normalizeUrl(submission.embed_source_url),
+    Landing_Page_URL: normalizeUrl(submission.landing_page_url || submission.embed_source_url),
+    Submitted_At: normalizeDateTime(submission.submitted_at) || new Date().toISOString(),
+    Idempotency_Key: nullableText(submission.idempotency_key),
   });
 }
 
-function mapPartialBase(submission, surgeonAlias) {
+function mapCommonBase(submission, surgeonAlias, { includeIdentity = true } = {}) {
   const phone = normalizePhoneE164(submission.phone_country_code, submission.phone_number);
+  const identity = includeIdentity
+    ? {
+        First_Name: nullableText(submission.first_name),
+        Last_Name: nullableText(submission.last_name),
+        Email: normalizeEmail(submission.email) || null,
+        Phone: phone || null,
+        Mobile: phone || null,
+      }
+    : {};
+
   return pruneEmpty({
-    First_Name: nullableText(submission.first_name),
-    Last_Name: nullableText(submission.last_name),
-    Email: nullableText(submission.email),
-    Phone: phone || null,
-    Mobile: phone || null,
+    ...identity,
     Country: nullableText(getCurrentCountry(submission)),
     State: nullableText(getCurrentState(submission)),
+    City: nullableText(getCurrentCity(submission)),
     Session_ID: nullableText(submission.session_id),
-    Date_of_Birth: nullableText(submission.date_of_birth),
-
-    // ✅ NEW: Preferred Language picklist
     [FIELD_LEAD_PREFERRED_LANGUAGE]: normalizePreferredLanguageForZoho(submission.preferred_language),
-
     Surgeon_name_Lookup: nullableText(submission.surgeon_id),
-
-    [FIELD_LEAD_EMBED_SOURCE_URL]: nullableText(submission.embed_source_url),
     [FIELD_LEAD_SURGEON_NAME]: nullableText(surgeonAlias),
-
     Intake_Date: nullableText(submission.submitted_at) || new Date().toISOString(),
+    ...mapAttribution(submission),
+  });
+}
+
+function mapLeadBase(submission, surgeonAlias) {
+  return mapCommonBase(submission, surgeonAlias, { includeIdentity: true });
+}
+
+function mapPartialBase(submission, surgeonAlias) {
+  return pruneEmpty({
+    ...mapCommonBase(submission, surgeonAlias, { includeIdentity: false }),
+    Date_of_Birth: nullableText(submission.date_of_birth),
   });
 }
 
 function mapCompleteBase(submission, surgeonAlias) {
-  const phone = normalizePhoneE164(submission.phone_country_code, submission.phone_number);
-
   return pruneEmpty({
-    First_Name: nullableText(submission.first_name),
-    Last_Name: nullableText(submission.last_name),
-    Email: nullableText(submission.email),
-    Phone: phone || null,
-    Mobile: phone || null,
+    ...mapCommonBase(submission, surgeonAlias, { includeIdentity: false }),
     Date_of_Birth: nullableText(submission.date_of_birth),
-
-    Country: nullableText(getCurrentCountry(submission)),
-    State: nullableText(getCurrentState(submission)),
-
-    Session_ID: nullableText(submission.session_id),
-
-    // ✅ NEW: Preferred Language picklist
-    [FIELD_LEAD_PREFERRED_LANGUAGE]: normalizePreferredLanguageForZoho(submission.preferred_language),
-
-    Surgeon_name_Lookup: nullableText(submission.surgeon_id),
-
-    [FIELD_LEAD_EMBED_SOURCE_URL]: nullableText(submission.embed_source_url),
-    [FIELD_LEAD_SURGEON_NAME]: nullableText(surgeonAlias),
-
     Payment_Method: nullableText(submission.payment_method),
-    Procedure_Timeline: nullableText(submission.timeline),
-
+    Procedure_Timeline: nullableText(submission.timeline || submission.procedure_timeline),
     Circumcised: boolToYesNo(submission.circumcised),
     Tobacco: boolToYesNo(submission.tobacco_use),
     ED_history: boolToYesNo(submission.ed_history),
     Active_STD: boolToYesNo(submission.active_std),
-
     Can_maintain_erection:
-      submission.ed_maintain_with_or_without_meds === null ||
-      submission.ed_maintain_with_or_without_meds === undefined
+      submission.ed_maintain_with_or_without_meds === null || submission.ed_maintain_with_or_without_meds === undefined
         ? null
         : boolToYesNo(submission.ed_maintain_with_or_without_meds),
-
     STD_list: toZohoJsonArray(submission.std_list),
     Previous_Penis_Surgeries: toZohoJsonArray(submission.prior_procedure_list),
-
     Recent_Outbreak:
       submission.recent_outbreak_6mo === null || submission.recent_outbreak_6mo === undefined
         ? null
         : boolToYesNo(submission.recent_outbreak_6mo),
-
-    // ✅ UPDATED: map to your NEW multiline field
     [FIELD_LEAD_MEDICAL_CONDITION_LIST]: toMultilineText(submission.medical_conditions_list),
-
     Body_Type: nullableText(submission.body_type),
+    Eligibility: nullableText(submission.eligibility),
     Outcome: nullableText(submission.outcome),
-
-    Intake_Date: nullableText(submission.submitted_at) || new Date().toISOString(),
+    Eligibility_Flags: toMultilineText(submission.eligibility_flags || submission.flags),
+    Eligibility_Reasons: toMultilineText(submission.eligibility_reasons || submission.reasons),
   });
 }
 
-// -------------------------
-// Zoho error helpers
-// -------------------------
 function stripPhoneFields(payload) {
   const { Phone, Mobile, ...rest } = payload || {};
-  return rest;
-}
-
-function stripEmailField(payload) {
-  const { Email, ...rest } = payload || {};
   return rest;
 }
 
@@ -808,23 +705,15 @@ function getApiNameFromZohoErr(zohoErr) {
   return zohoErr?.details?.api_name || null;
 }
 
-// -------------------------
-// Zoho upsert (with triggers)
-// -------------------------
 async function createLead(payload) {
-  const resp = await zohoPOST(`/crm/v2/${MODULE_LEADS}`, {
-    trigger: ZOHO_TRIGGER,
-    data: [payload],
-  });
+  const resp = await zohoPOST(`/crm/v2/${MODULE_LEADS}`, { trigger: ZOHO_TRIGGER, data: [payload] });
   const first = resp?.data?.[0];
-
   if (first?.status !== "success") {
     const err = new Error("createLead failed");
     err.zoho = first || resp;
     err.httpStatus = 400;
     throw err;
   }
-
   const id = first?.details?.id;
   if (!id) {
     const err = new Error("createLead failed (no id returned)");
@@ -835,35 +724,17 @@ async function createLead(payload) {
   return id;
 }
 
-// Create with recovery (prevents “no lead created” from one rejected field)
 async function createLeadWithRecovery(payload) {
   let working = { ...payload };
   const removed = [];
-
   for (let attempt = 1; attempt <= 8; attempt++) {
     try {
       const id = await createLead(working);
       return { id, removed_fields: removed };
     } catch (e) {
       const zohoErr = e?.zoho || null;
-
-      if (isDuplicateZohoErrorForField(zohoErr, "Email") && working.Email) {
-        working = stripEmailField(working);
-        removed.push("Email");
-        debugLog("[Zoho create] DUPLICATE Email -> strip Email and retry");
-        continue;
-      }
-
-      if (
-        (isDuplicateZohoErrorForField(zohoErr, "Phone") && (working.Phone || working.Mobile)) ||
-        (isDuplicateZohoErrorForField(zohoErr, "Mobile") && (working.Phone || working.Mobile))
-      ) {
-        working = stripPhoneFields(working);
-        removed.push("Phone", "Mobile");
-        debugLog("[Zoho create] DUPLICATE phone -> strip Phone/Mobile and retry");
-        continue;
-      }
-
+      if (isDuplicateZohoErrorForField(zohoErr, "Email")) throw e;
+      if (isDuplicateZohoErrorForField(zohoErr, "Phone") || isDuplicateZohoErrorForField(zohoErr, "Mobile")) throw e;
       if (isInvalidDataLike(zohoErr)) {
         const apiName = getApiNameFromZohoErr(zohoErr);
         if (apiName && Object.prototype.hasOwnProperty.call(working, apiName)) {
@@ -873,61 +744,50 @@ async function createLeadWithRecovery(payload) {
           continue;
         }
       }
-
       throw e;
     }
   }
-
   const err = new Error("createLead failed after retries");
   err.httpStatus = 500;
   throw err;
 }
 
 async function updateLeadOnce(leadId, payload) {
-  const resp = await zohoPUT(`/crm/v2/${MODULE_LEADS}/${leadId}`, {
-    trigger: ZOHO_TRIGGER,
-    data: [payload],
-  });
+  const resp = await zohoPUT(`/crm/v2/${MODULE_LEADS}/${leadId}`, { trigger: ZOHO_TRIGGER, data: [payload] });
   const first = resp?.data?.[0];
-
   if (first?.status !== "success") {
     const err = new Error("updateLead failed");
     err.zoho = first || resp;
     err.httpStatus = 400;
     throw err;
   }
-
   return true;
 }
 
 async function updateLeadWithRecovery(leadId, payload) {
   let working = { ...payload };
   const removed = [];
-
   for (let attempt = 1; attempt <= 8; attempt++) {
     try {
       await updateLeadOnce(leadId, working);
       return { success: true, removed_fields: removed };
     } catch (e) {
       const zohoErr = e?.zoho || null;
-
       if (isDuplicateZohoErrorForField(zohoErr, "Email") && working.Email) {
-        working = stripEmailField(working);
+        delete working.Email;
         removed.push("Email");
-        debugLog("[Zoho] DUPLICATE Email -> strip Email and retry");
+        debugLog("[Zoho update] DUPLICATE Email -> remove from update payload and retry");
         continue;
       }
-
       if (
         (isDuplicateZohoErrorForField(zohoErr, "Phone") && (working.Phone || working.Mobile)) ||
         (isDuplicateZohoErrorForField(zohoErr, "Mobile") && (working.Phone || working.Mobile))
       ) {
         working = stripPhoneFields(working);
         removed.push("Phone", "Mobile");
-        debugLog("[Zoho] DUPLICATE phone -> strip Phone/Mobile and retry");
+        debugLog("[Zoho update] DUPLICATE phone -> remove Phone/Mobile from update payload and retry");
         continue;
       }
-
       if (isInvalidDataLike(zohoErr)) {
         const apiName = getApiNameFromZohoErr(zohoErr);
         if (apiName && Object.prototype.hasOwnProperty.call(working, apiName)) {
@@ -937,127 +797,208 @@ async function updateLeadWithRecovery(leadId, payload) {
           continue;
         }
       }
-
       throw e;
     }
   }
-
   const err = new Error("updateLead failed after retries");
   err.httpStatus = 500;
   throw err;
 }
 
-// -------------------------
-// Submissions endpoint
-// -------------------------
+function makeSubmissionLockKey({ type, sessionId, email, phoneE164, idempotencyKey }) {
+  const idem = String(idempotencyKey || "").trim();
+  if (idem) return `idem:${idem}`;
+  if (type === "lead") return `lead:${sessionId || ""}:${email || ""}:${phoneE164 || ""}`;
+  return `${type}:${sessionId || ""}`;
+}
+
+async function withSubmissionLock(key, fn, { cacheRecent = false } = {}) {
+  const now = Date.now();
+  const cached = recentSubmissionResults.get(key);
+  if (cached && cached.expiresAt > now) return cached.result;
+  if (cached) recentSubmissionResults.delete(key);
+
+  if (inFlightSubmissions.has(key)) return inFlightSubmissions.get(key);
+
+  const promise = (async () => {
+    const result = await fn();
+    if (cacheRecent) {
+      recentSubmissionResults.set(key, { result, expiresAt: Date.now() + RECENT_RESULT_TTL_MS });
+      setTimeout(() => recentSubmissionResults.delete(key), RECENT_RESULT_TTL_MS).unref?.();
+    }
+    return result;
+  })();
+
+  inFlightSubmissions.set(key, promise);
+  setTimeout(() => inFlightSubmissions.delete(key), IN_FLIGHT_TTL_MS).unref?.();
+  try {
+    return await promise;
+  } finally {
+    inFlightSubmissions.delete(key);
+  }
+}
+
+async function handleDuplicateCreateAsUpdate({ error, payloadWithAppend, sessionId, email, phoneE164 }) {
+  const zohoErr = error?.zoho || null;
+  let found = null;
+  let matchedBy = "none";
+
+  if (isDuplicateZohoErrorForField(zohoErr, "Email") && email) {
+    found = await searchLeadByEmail(email);
+    matchedBy = "duplicate_email";
+  }
+  if (!found && (isDuplicateZohoErrorForField(zohoErr, "Phone") || isDuplicateZohoErrorForField(zohoErr, "Mobile")) && phoneE164) {
+    found = await searchLeadByPhoneE164(phoneE164);
+    matchedBy = "duplicate_phone";
+  }
+  if (!found && sessionId) {
+    found = await searchLeadBySessionId(sessionId);
+    matchedBy = "duplicate_session";
+  }
+  if (!found?.id) throw error;
+
+  const updatePayload = await appendQuestionnaireDetailsToExistingLead(found.id, payloadWithAppend, {}, "duplicate_recovery", {
+    sessionId,
+    email,
+    phone: phoneE164,
+  });
+  const upd = await updateLeadWithRecovery(found.id, updatePayload);
+  return { id: found.id, created: false, matched_by: matchedBy, removed_fields: upd.removed_fields || [] };
+}
+
 app.post("/api/submissions", async (req, res) => {
   const submission = req.body || {};
   const type = String(submission.submission_type || "").toLowerCase();
-
   const sessionId = String(submission.session_id || "").trim();
-  const email = String(submission.email || "").trim();
+  const email = normalizeEmail(submission.email);
+  const suppliedEmail = String(submission.email || "").trim();
   const phoneE164 = normalizePhoneE164(submission.phone_country_code, submission.phone_number);
-
+  const idempotencyKey = nullableText(submission.idempotency_key);
   let lead = null;
-  let matchedBy = "none";
 
   try {
     if (!["lead", "partial", "complete"].includes(type)) {
-      return res.status(400).json({
-        success: false,
-        error: "submission_type must be 'lead', 'partial', or 'complete'.",
-      });
+      return res.status(400).json({ success: false, error: "submission_type must be 'lead', 'partial', or 'complete'." });
     }
 
-    if (!sessionId && !email && !phoneE164) {
-      return res.status(400).json({ success: false, error: "Need session_id, email, or phone." });
+    if (!sessionId) {
+      return res.status(400).json({ success: false, error: "session_id is required." });
     }
 
-    const found = await findLeadByPriority({ email, phoneE164, sessionId });
-    lead = found.lead;
-    matchedBy = found.matchedBy;
-
-    // Surgeon alias enrichment
-    const surgeonId = String(submission.surgeon_id || "").trim();
-    const surgeonAlias = surgeonId ? await fetchSurgeonAlias(surgeonId) : null;
-
-    const payloadBase =
-      type === "lead"
-        ? mapLeadBase(submission, surgeonAlias)
-        : type === "partial"
-        ? mapPartialBase(submission, surgeonAlias)
-        : mapCompleteBase(submission, surgeonAlias);
-
-    if (lead?.id) {
-      const payloadWithAppend = await appendQuestionnaireDetailsToExistingLead(
-        lead.id,
-        payloadBase,
-        submission,
-        type,
-        { sessionId, email, phone: phoneE164 }
-      );
-
-      // Start both Zoho update and Supabase webhook in parallel for speed
-      const zohoUpdatePromise = updateLeadWithRecovery(lead.id, payloadWithAppend);
-
-      let supabaseWebhookPromise = Promise.resolve(null);
-      if (type === "complete" && email) {
-        supabaseWebhookPromise = notifySupabaseEligibilityComplete(email);
-      }
-
-      // Wait for both to finish
-      const [upd, supabaseWebhookResult] = await Promise.all([zohoUpdatePromise, supabaseWebhookPromise]);
-
-      if ((upd.removed_fields || []).includes(FIELD_QUESTIONNAIRE_DETAILS)) {
-        await createZohoErrorTask({
-          leadId: lead.id,
-          submissionType: type,
-          sessionId,
-          email,
-          phoneE164,
-          errorMessage: "Zoho rejected Questionnaire_Details; full payload saved here.",
-          zohoDetails: { code: "QUESTIONNAIRE_DETAILS_REJECTED" },
-          submissionPayload: submission,
-        });
-      }
-
-      return res.json({
-        success: true,
-        matched_by: matchedBy,
-        removed_fields: upd.removed_fields || [],
-        supabase_webhook: supabaseWebhookResult,
-      });
+    if (suppliedEmail && !email) {
+      return res.status(400).json({ success: false, error: "email is invalid." });
     }
 
-    // No lead exists -> create one with initial Questionnaire_Details
-    const initialEntry = buildEntryString(submission, type, { sessionId, email, phone: phoneE164 });
-    const createPayload = {
-      ...payloadBase,
-      [FIELD_QUESTIONNAIRE_DETAILS]: clampToMaxCharsKeepNewest(initialEntry, QUESTIONNAIRE_DETAILS_MAX_CHARS),
-    };
-
-    // Start both Zoho creation and Supabase webhook in parallel for speed
-    const zohoCreatePromise = createLeadWithRecovery(createPayload);
-
-    let supabaseWebhookPromiseNoLead = Promise.resolve(null);
-    if (type === "complete" && email) {
-      supabaseWebhookPromiseNoLead = notifySupabaseEligibilityComplete(email);
+    if (type === "lead" && !email && !phoneE164) {
+      return res.status(400).json({ success: false, error: "lead submissions require a valid email or phone." });
     }
 
-    // Wait for both to finish
-    const [created, supabaseWebhookResultNoLead] = await Promise.all([zohoCreatePromise, supabaseWebhookPromiseNoLead]);
+    const lockKey = makeSubmissionLockKey({ type, sessionId, email, phoneE164, idempotencyKey });
+    const cacheRecent = Boolean(idempotencyKey) || type === "lead";
 
-    return res.json({
-      success: true,
-      created: true,
-      lead_id: created.id,
-      removed_fields: created.removed_fields || [],
-      supabase_webhook: supabaseWebhookResultNoLead,
-    });
+    const result = await withSubmissionLock(
+      lockKey,
+      async () => {
+        const found =
+          type === "lead"
+            ? await findLeadForInitialLead({ sessionId, email, phoneE164 })
+            : await findLeadForQuestionnaire({ sessionId });
+
+        lead = found.lead;
+        let matchedBy = found.matchedBy;
+
+        if (!lead?.id && type !== "lead") {
+          return {
+            status: 409,
+            body: {
+              success: false,
+              error: "No existing Lead found for this session_id. Partial and complete submissions cannot create Leads.",
+              session_id: sessionId,
+            },
+          };
+        }
+
+        const surgeonId = String(submission.surgeon_id || "").trim();
+        const surgeonAlias = surgeonId ? await fetchSurgeonAlias(surgeonId) : null;
+        const payloadBase =
+          type === "lead" ? mapLeadBase(submission, surgeonAlias) : type === "partial" ? mapPartialBase(submission, surgeonAlias) : mapCompleteBase(submission, surgeonAlias);
+
+        if (lead?.id) {
+          const payloadWithAppend = await appendQuestionnaireDetailsToExistingLead(lead.id, payloadBase, submission, type, {
+            sessionId,
+            email,
+            phone: phoneE164,
+          });
+
+          const upd = await updateLeadWithRecovery(lead.id, payloadWithAppend);
+          let supabaseWebhookResult = null;
+          const webhookEmail = email || normalizeEmail(lead?.Email);
+          if (type === "complete") {
+            supabaseWebhookResult = await notifySupabaseEligibilityComplete(webhookEmail);
+          }
+
+          return {
+            status: 200,
+            body: {
+              success: true,
+              created: false,
+              lead_id: lead.id,
+              matched_by: matchedBy,
+              removed_fields: upd.removed_fields || [],
+              supabase_webhook: supabaseWebhookResult,
+            },
+          };
+        }
+
+        const initialEntry = buildEntryString(submission, type, { sessionId, email, phone: phoneE164 });
+        const createPayload = {
+          ...payloadBase,
+          [FIELD_QUESTIONNAIRE_DETAILS]: clampToMaxCharsKeepNewest(initialEntry, QUESTIONNAIRE_DETAILS_MAX_CHARS),
+          [FIELD_QUESTIONNAIRE_DETAILS_2]: clampToMaxCharsKeepNewest(initialEntry, QUESTIONNAIRE_DETAILS_2_MAX_CHARS),
+        };
+
+        try {
+          const created = await createLeadWithRecovery(createPayload);
+          return {
+            status: 200,
+            body: {
+              success: true,
+              created: true,
+              lead_id: created.id,
+              matched_by: "created",
+              removed_fields: created.removed_fields || [],
+              supabase_webhook: null,
+            },
+          };
+        } catch (e) {
+          const recovered = await handleDuplicateCreateAsUpdate({
+            error: e,
+            payloadWithAppend: createPayload,
+            sessionId,
+            email,
+            phoneE164,
+          });
+          return {
+            status: 200,
+            body: {
+              success: true,
+              created: recovered.created,
+              lead_id: recovered.id,
+              matched_by: recovered.matched_by,
+              removed_fields: recovered.removed_fields || [],
+              duplicate_recovered: true,
+              supabase_webhook: null,
+            },
+          };
+        }
+      },
+      { cacheRecent }
+    );
+
+    return res.status(result.status).json(result.body);
   } catch (e) {
     const zohoErr = e?.zoho || null;
     const zohoHttp = e?.httpStatus || null;
-
     await createZohoErrorTask({
       leadId: lead?.id || null,
       submissionType: type,
@@ -1068,7 +1009,6 @@ app.post("/api/submissions", async (req, res) => {
       zohoDetails: zohoErr,
       submissionPayload: submission,
     });
-
     console.error(
       "[POST /api/submissions] error:",
       String(e?.message || e),
@@ -1076,9 +1016,7 @@ app.post("/api/submissions", async (req, res) => {
       zohoErr?.code ? `(zoho_code=${zohoErr.code})` : "",
       zohoErr?.details?.api_name ? `(api_name=${zohoErr.details.api_name})` : ""
     );
-
     const nonRetryable = zohoHttp && zohoHttp >= 400 && zohoHttp < 500;
-
     if (nonRetryable) {
       return res.status(200).json({
         success: true,
@@ -1090,7 +1028,6 @@ app.post("/api/submissions", async (req, res) => {
         zoho_debug: DEBUG ? zohoErr : undefined,
       });
     }
-
     return res.status(500).json({ success: false, error: "submission failed" });
   }
 });
