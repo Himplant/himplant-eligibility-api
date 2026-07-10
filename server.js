@@ -182,8 +182,17 @@ function toMultilineText(value) {
     return s ? s : null;
   }
   if (Array.isArray(value)) {
-    const lines = value.map((x) => String(x || "").trim()).filter(Boolean);
+    const lines = value
+      .map((x) => {
+        if (x === undefined || x === null) return "";
+        if (typeof x === "object") return safeJsonStringify(x, 4000);
+        return String(x).trim();
+      })
+      .filter(Boolean);
     return lines.length ? lines.join("\n") : null;
+  }
+  if (typeof value === "object") {
+    return safeJsonStringify(value, 12000);
   }
   const s = String(value).trim();
   return s ? s : null;
@@ -270,8 +279,35 @@ function normalizeUrl(v) {
   return s || null;
 }
 
+function normalizeHostFromValue(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  const stripped = raw.replace(/^Referral:\s*/i, "").trim();
+  try {
+    return new URL(stripped).hostname.toLowerCase().replace(/^www\./, "");
+  } catch {
+    return stripped.toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").split(/[/?#]/)[0];
+  }
+}
+
+function normalizeLeadSourceForZoho(value) {
+  const s = String(value || "").trim();
+  if (!s) return null;
+  const lower = s.toLowerCase();
+  const host = normalizeHostFromValue(s);
+
+  if (lower === "google ads" || host === "get.himplant.com" || lower.includes("get.himplant.com")) {
+    return "Google Ads";
+  }
+
+  if (host === "himplant.com" || lower.includes("himplant.com") || lower.includes("www.himplant.com")) {
+    return "himplant.com";
+  }
+
+  return s;
+}
+
 function deriveLeadSource(submission) {
-  const explicit = nullableText(submission.lead_source);
   const signals = [
     submission.gclid,
     submission.gclid2,
@@ -282,6 +318,7 @@ function deriveLeadSource(submission) {
     submission.embed_source_url,
     submission.landing_page_url,
     submission.referrer,
+    submission.lead_source,
   ]
     .map((x) => String(x || "").toLowerCase())
     .join(" ");
@@ -298,7 +335,7 @@ function deriveLeadSource(submission) {
     return "Google Ads";
   }
 
-  return explicit;
+  return normalizeLeadSourceForZoho(submission.lead_source || submission.embed_source_url || submission.landing_page_url || submission.referrer);
 }
 
 function getOutcomeValue(submission) {
@@ -313,6 +350,13 @@ function getOutcomeValue(submission) {
 
 function getEligibilityValue(submission) {
   return firstText(submission.eligibility, submission.eligibility_outcome, submission.outcome, submission.result);
+}
+
+function preserveExistingLeadSource(lead, payload) {
+  const existingLeadSource = nullableText(lead?.Lead_Source);
+  if (!existingLeadSource) return payload;
+  const { Lead_Source, ...rest } = payload || {};
+  return rest;
 }
 
 const ZOHO_TRIGGER = ["workflow", "blueprint"];
@@ -602,7 +646,7 @@ function buildSummaryEntryString(submission, type, extra = {}) {
     `surgeon=${submission.surgeon_name || submission.surgeon_id || ""}`,
     `location=${[getCurrentCity(submission), getCurrentState(submission), getCurrentCountry(submission)].filter(Boolean).join(", ")}`,
     `language=${submission.preferred_language || ""}`,
-    `source=${submission.lead_source || ""}`,
+    `source=${deriveLeadSource(submission) || ""}`,
   ].filter(Boolean);
 
   return lines.join("\n") + "\n\n";
@@ -893,7 +937,8 @@ async function handleDuplicateCreateAsUpdate({ error, payloadWithAppend, session
   }
   if (!found?.id) throw error;
 
-  const updatePayload = await appendQuestionnaireDetailsToExistingLead(found.id, payloadWithAppend, {}, "duplicate_recovery", {
+  const payloadPreservingSource = preserveExistingLeadSource(found, payloadWithAppend);
+  const updatePayload = await appendQuestionnaireDetailsToExistingLead(found.id, payloadPreservingSource, {}, "duplicate_recovery", {
     sessionId,
     email,
     phone: phoneE164,
@@ -956,8 +1001,9 @@ app.post("/api/submissions", async (req, res) => {
 
         const surgeonId = String(submission.surgeon_id || "").trim();
         const surgeonAlias = surgeonId ? await fetchSurgeonAlias(surgeonId) : null;
-        const payloadBase =
+        const rawPayloadBase =
           type === "lead" ? mapLeadBase(submission, surgeonAlias) : type === "partial" ? mapPartialBase(submission, surgeonAlias) : mapCompleteBase(submission, surgeonAlias);
+        const payloadBase = lead?.id ? preserveExistingLeadSource(lead, rawPayloadBase) : rawPayloadBase;
 
         if (lead?.id) {
           const payloadWithAppend = await appendQuestionnaireDetailsToExistingLead(lead.id, payloadBase, submission, type, {
