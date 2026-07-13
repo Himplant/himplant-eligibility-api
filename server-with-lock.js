@@ -1,5 +1,6 @@
 import "dotenv/config";
 import express from "express";
+import cors from "cors";
 import fetch from "node-fetch";
 import crypto from "crypto";
 
@@ -10,7 +11,39 @@ process.env.PORT = String(internalPort);
 await import("./server.js");
 process.env.PORT = originalPort;
 
+const ALLOWED_ORIGINS = [
+  "https://eligibility.himplant.com",
+  "https://himplant.com",
+  "https://www.himplant.com",
+  "https://get.himplant.com",
+  "https://lovableproject.com",
+  "https://lovable.dev",
+  "https://bc248be2-fa03-4ded-a845-6db79ac12fb7.lovableproject.com",
+  "https://himplanteligibility.lovable.app",
+  "http://localhost:8080",
+  "http://localhost:3000",
+  "http://localhost:5173",
+  "http://127.0.0.1:8080",
+  "http://127.0.0.1:3000",
+  "http://127.0.0.1:5173",
+];
+
 const app = express();
+app.use(
+  cors({
+    origin(origin, callback) {
+      if (!origin) return callback(null, true);
+      if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+      if (origin.startsWith("http://localhost:") || origin.startsWith("http://127.0.0.1:")) {
+        return callback(null, true);
+      }
+      return callback(new Error("Not allowed by CORS"));
+    },
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
+app.options("*", cors());
 app.use(express.json({ limit: "5mb" }));
 
 const DEFAULT_SUPABASE_FUNCTION_URL = "https://nfoeswlppebvxaomfnsk.supabase.co/functions/v1/eligibility-complete";
@@ -57,107 +90,4 @@ function lockPayload(submission) {
   };
 }
 async function rpc(name, payload) {
-  const response = await fetch(`${SUPABASE_BASE_URL}/rest/v1/rpc/${name}`, {
-    method: "POST",
-    headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json", Accept: "application/json" },
-    body: JSON.stringify(payload || {}),
-  });
-  const text = await response.text();
-  let data;
-  try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
-  if (!response.ok) {
-    const error = new Error(`lock rpc ${name} failed: ${response.status}`);
-    error.details = data;
-    throw error;
-  }
-  return Array.isArray(data) ? data[0] : data;
-}
-async function acquireLock(submission) { return rpc("acquire_eligibility_lead_lock", lockPayload(submission)); }
-async function resolveLock(submission) {
-  const payload = lockPayload(submission);
-  delete payload.p_lock_ttl_seconds;
-  return rpc("resolve_eligibility_lead_lock", payload);
-}
-async function completeLock(submission, internalResult) {
-  const payload = lockPayload(submission);
-  delete payload.p_lock_ttl_seconds;
-  return rpc("complete_eligibility_lead_lock", { ...payload, p_zoho_lead_id: internalResult?.body?.lead_id ? String(internalResult.body.lead_id) : null, p_last_response: internalResult?.body || null });
-}
-async function failLock(submission, message) {
-  const payload = lockPayload(submission);
-  delete payload.p_lock_ttl_seconds;
-  try { await rpc("fail_eligibility_lead_lock", { ...payload, p_error_message: String(message || "submission failed") }); }
-  catch (error) { console.error("[submission-lock] fail lock error:", error.message, error.details || ""); }
-}
-function cached(lockRow) {
-  if (!lockRow?.last_response) return null;
-  return { status: 200, body: { ...lockRow.last_response, duplicate_replay: true, persistent_lock: { status: lockRow.status, zoho_lead_id: lockRow.zoho_lead_id || lockRow.last_response?.lead_id || null } } };
-}
-async function waitForLock(submission) {
-  const start = Date.now();
-  while (Date.now() - start < LOCK_WAIT_MS) {
-    await sleep(LOCK_POLL_MS);
-    const row = await resolveLock(submission);
-    if (row?.status === "completed" && row?.last_response) return cached(row);
-    if (row?.status === "failed") return null;
-  }
-  return { status: 409, body: { success: false, error: "duplicate_submission_processing", message: "A matching submission is already being processed. Please retry shortly." } };
-}
-async function postInternal(submission) {
-  const response = await fetch(`http://127.0.0.1:${internalPort}/api/submissions`, { method: "POST", headers: { "Content-Type": "application/json", Accept: "application/json" }, body: JSON.stringify(submission) });
-  const text = await response.text();
-  let body;
-  try { body = text ? JSON.parse(text) : {}; } catch { body = { raw: text }; }
-  return { status: response.status, body };
-}
-async function proxy(req, res) {
-  const headers = { ...req.headers };
-  delete headers.host; delete headers.connection; delete headers["content-length"];
-  const hasBody = !["GET", "HEAD"].includes(req.method.toUpperCase());
-  const response = await fetch(`http://127.0.0.1:${internalPort}${req.originalUrl}`, { method: req.method, headers, body: hasBody ? JSON.stringify(req.body || {}) : undefined });
-  res.status(response.status);
-  response.headers.forEach((value, key) => { if (!["content-encoding", "content-length", "transfer-encoding"].includes(key.toLowerCase())) res.setHeader(key, value); });
-  res.send(Buffer.from(await response.arrayBuffer()));
-}
-function shouldLock(submission) {
-  const type = String(submission?.submission_type || "").toLowerCase();
-  return ["lead", "partial", "complete"].includes(type) && Boolean(String(submission?.session_id || "").trim());
-}
-
-app.post("/api/submissions", async (req, res) => {
-  const submission = req.body || {};
-  if (!shouldLock(submission) || !lockReady()) {
-    if (!lockReady()) console.warn("[submission-lock] not configured; forwarding without persistent lock");
-    const internal = await postInternal(submission);
-    return res.status(internal.status).json(internal.body);
-  }
-  let acquired = false;
-  try {
-    const lock = await acquireLock(submission);
-    acquired = Boolean(lock?.acquired);
-    if (!acquired) {
-      if (lock?.status === "completed" && lock?.last_response) {
-        const hit = cached(lock);
-        return res.status(hit.status).json(hit.body);
-      }
-      const resolved = await waitForLock(submission);
-      if (resolved) return res.status(resolved.status).json(resolved.body);
-      return res.status(409).json({ success: false, error: "submission_lock_unavailable" });
-    }
-    const internal = await postInternal(submission);
-    if (internal.status >= 200 && internal.status < 300 && internal.body?.success !== false) await completeLock(submission, internal);
-    else await failLock(submission, internal.body?.error || `internal status ${internal.status}`);
-    return res.status(internal.status).json(internal.body);
-  } catch (error) {
-    console.error("[submission-lock] error:", error.message, error.details || "");
-    if (acquired) await failLock(submission, error.message);
-    return res.status(503).json({ success: false, error: "submission_lock_error", message: "Submission could not be safely processed. Please retry shortly." });
-  }
-});
-
-app.use(async (req, res) => {
-  try { await proxy(req, res); }
-  catch (error) { console.error("[proxy] error:", error.message || error); res.status(502).json({ success: false, error: "proxy_failed" }); }
-});
-
-app.listen(externalPort, () => console.log(`API lock wrapper running on port ${externalPort}, proxying to ${internalPort}`));
+  const response = await fetch(`${SUPAB
