@@ -2,9 +2,9 @@
   "name": "himplant-eligibility-api",
   "version": "1.0.0",
   "type": "module",
-  "main": "server-with-lock.js",
+  "main": "server.js",
   "scripts": {
-    "start": "node server-with-lock.js"
+    "start": "node server.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
