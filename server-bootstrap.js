@@ -27,12 +27,15 @@ const ZOHO_ACCOUNTS = "https://accounts.zoho.com";
 const ZOHO_API_BASE = "https://www.zohoapis.com";
 const { ZOHO_CLIENT_ID, ZOHO_CLIENT_SECRET, ZOHO_REFRESH_TOKEN } = process.env;
 
-// These are Lead-module fields populated by the existing Zoho `calendarupdate`
-// workflow after the assignment rule sets the Lead Owner. Reading the copied
-// fields is more reliable than requiring the API token to have Users.READ.
-const LEAD_CALENDAR_EN = "Lead_Owner_Calendar_Link";
-const LEAD_CALENDAR_ES = "Spanish_Calendar_Link";
-const LEAD_CALENDAR_AR = "Arabic_Calendar_Link";
+// Calendar fields live on the Zoho CRM USER profile. The Lead is used only to
+// resolve the current Owner.id. No copied Lead calendar field is used as the
+// source of truth.
+const USER_CALENDAR_EN = "Calendar_Link";
+const USER_CALENDAR_ES = "Spanish_Calendar_Link";
+const USER_CALENDAR_AR = "Arabic_Calendar_Link";
+
+const ASSIGNMENT_GRACE_MS = 30_000;
+const OWNER_STABILITY_CHECK_MS = 1_250;
 
 let ownerLookupAccessToken = null;
 let ownerLookupTokenExpiresAt = 0;
@@ -48,23 +51,25 @@ function normalizeLanguage(value) {
   return lang === "es" || lang === "ar" ? lang : "en";
 }
 
-function pickLeadCalendar(lead, language) {
-  const english = String(lead?.[LEAD_CALENDAR_EN] || "").trim();
-  const spanish = String(lead?.[LEAD_CALENDAR_ES] || "").trim();
-  const arabic = String(lead?.[LEAD_CALENDAR_AR] || "").trim();
+function requestedCalendarField(language) {
+  if (language === "es") return USER_CALENDAR_ES;
+  if (language === "ar") return USER_CALENDAR_AR;
+  return USER_CALENDAR_EN;
+}
 
-  if (language === "es") {
-    if (spanish) return { bookingUrl: spanish, calendarField: LEAD_CALENDAR_ES };
-    if (english) return { bookingUrl: english, calendarField: LEAD_CALENDAR_EN };
-  }
+function pickOwnerCalendar(user, language) {
+  const calendarField = requestedCalendarField(language);
+  const bookingUrl = String(user?.[calendarField] || "").trim() || null;
+  return { bookingUrl, calendarField };
+}
 
-  if (language === "ar") {
-    if (arabic) return { bookingUrl: arabic, calendarField: LEAD_CALENDAR_AR };
-    if (english) return { bookingUrl: english, calendarField: LEAD_CALENDAR_EN };
-  }
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
-  if (english) return { bookingUrl: english, calendarField: LEAD_CALENDAR_EN };
-  return { bookingUrl: null, calendarField: null };
+function recordAgeMs(lead) {
+  const createdAt = Date.parse(String(lead?.Created_Time || ""));
+  return Number.isFinite(createdAt) ? Math.max(0, Date.now() - createdAt) : null;
 }
 
 async function getOwnerLookupAccessToken() {
@@ -74,7 +79,9 @@ async function getOwnerLookupAccessToken() {
   }
 
   if (!ZOHO_CLIENT_ID || !ZOHO_CLIENT_SECRET || !ZOHO_REFRESH_TOKEN) {
-    throw new Error("Missing Zoho env vars");
+    const error = new Error("Missing Zoho env vars");
+    error.code = "ZOHO_ENV_MISSING";
+    throw error;
   }
 
   const params = new URLSearchParams({
@@ -90,7 +97,10 @@ async function getOwnerLookupAccessToken() {
   const data = await response.json().catch(() => ({}));
 
   if (!response.ok || !data.access_token) {
-    throw new Error("Zoho token refresh failed for owner booking lookup");
+    const error = new Error("Zoho token refresh failed for owner booking lookup");
+    error.status = response.status;
+    error.code = data?.error || "ZOHO_TOKEN_REFRESH_FAILED";
+    throw error;
   }
 
   ownerLookupAccessToken = data.access_token;
@@ -104,9 +114,15 @@ async function ownerLookupZohoGet(path) {
     headers: { Authorization: `Zoho-oauthtoken ${token}` },
   });
   const data = await response.json().catch(() => ({}));
+
   if (!response.ok) {
-    throw new Error(`Zoho owner booking lookup failed (${response.status})`);
+    const error = new Error(`Zoho owner booking lookup failed (${response.status})`);
+    error.status = response.status;
+    error.code = data?.code || "ZOHO_API_ERROR";
+    error.zohoMessage = data?.message || null;
+    throw error;
   }
+
   return data;
 }
 
@@ -127,39 +143,43 @@ async function findLeadByEmail(email) {
   return data?.data?.[0] || null;
 }
 
-function wait(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+async function getLeadById(leadId) {
+  const data = await ownerLookupZohoGet(`/crm/v2/Leads/${encodeURIComponent(leadId)}`);
+  return data?.data?.[0] || null;
 }
 
-async function findLeadWithRetry(sessionId, email) {
-  // Zoho's search index can lag briefly after record creation/update. Retry a
-  // few times so the result page does not race the assignment/calendar workflow.
-  const delays = [0, 500, 1000, 1500];
-  let lastLead = null;
-  let lastMatchedBy = null;
+async function getUserById(userId) {
+  const data = await ownerLookupZohoGet(`/crm/v2/users/${encodeURIComponent(userId)}`);
+  return data?.users?.[0] || null;
+}
 
-  for (const delay of delays) {
-    if (delay) await wait(delay);
+async function resolveLead(sessionId, email) {
+  // Session_ID is authoritative. Email is a fallback only for temporary Zoho
+  // search-index lag or an older intake that did not persist Session_ID cleanly.
+  let lead = await findLeadBySessionId(sessionId);
+  let matchedBy = "session";
 
-    let lead = await findLeadBySessionId(sessionId);
-    let matchedBy = "session";
-
-    if (!lead && email) {
-      lead = await findLeadByEmail(email);
-      matchedBy = "email";
-    }
-
-    if (lead?.id) {
-      lastLead = lead;
-      lastMatchedBy = matchedBy;
-      const { bookingUrl } = pickLeadCalendar(lead, normalizeLanguage(lead?.Preferred_Language));
-      if (bookingUrl && lead?.Owner?.id) {
-        return { lead, matchedBy };
-      }
-    }
+  if (!lead && email) {
+    lead = await findLeadByEmail(email);
+    matchedBy = "email";
   }
 
-  return { lead: lastLead, matchedBy: lastMatchedBy };
+  if (!lead?.id) return { lead: null, matchedBy: null };
+
+  // Re-read by Zoho record ID so Owner reflects the current CRM record rather
+  // than a potentially stale search-index snapshot.
+  const freshLead = await getLeadById(lead.id);
+  return { lead: freshLead || lead, matchedBy };
+}
+
+function pending(res, reason, extra = {}) {
+  return res.json({
+    status: "pending",
+    reason,
+    retryAfterMs: 1500,
+    bookingUrl: null,
+    ...extra,
+  });
 }
 
 capturedApp.get("/api/lead-owner-booking", async (req, res) => {
@@ -169,41 +189,129 @@ capturedApp.get("/api/lead-owner-booking", async (req, res) => {
   const language = normalizeLanguage(req.query.lang);
 
   if (!sessionId) {
-    return res.status(400).json({ error: "session_id is required" });
+    return res.status(400).json({ status: "error", error: "session_id is required" });
   }
 
   if (suppliedEmail && !email) {
-    return res.status(400).json({ error: "email is invalid" });
+    return res.status(400).json({ status: "error", error: "email is invalid" });
   }
 
   try {
-    const { lead, matchedBy } = await findLeadWithRetry(sessionId, email);
+    const first = await resolveLead(sessionId, email);
+    let lead = first.lead;
 
+    // Never expose a booking calendar until the questionnaire can be tied back
+    // to a real Zoho CRM Lead.
     if (!lead?.id) {
-      return res.status(404).json({ error: "lead not found" });
+      return pending(res, "crm_record_not_ready", { stage: "lead" });
     }
 
-    const ownerId = String(lead?.Owner?.id || "").trim();
+    let ownerId = String(lead?.Owner?.id || "").trim();
     if (!ownerId) {
-      return res.status(404).json({ error: "lead owner not found" });
+      return pending(res, "owner_not_ready", {
+        stage: "owner",
+        leadId: lead.id,
+        matchedBy: first.matchedBy,
+      });
     }
 
-    const { bookingUrl, calendarField } = pickLeadCalendar(lead, language);
+    // Zoho creates the record under the API/creator user before assignment rules
+    // can replace Owner. For a newly created record, do not accept that temporary
+    // owner immediately; allow the assignment workflow time to finish.
+    const createdById = String(lead?.Created_By?.id || "").trim();
+    const ageMs = recordAgeMs(lead);
+    if (createdById && ownerId === createdById && ageMs !== null && ageMs < ASSIGNMENT_GRACE_MS) {
+      return pending(res, "owner_assignment_in_progress", {
+        stage: "owner",
+        leadId: lead.id,
+        matchedBy: first.matchedBy,
+      });
+    }
+
+    // Confirm the Owner is stable on the actual CRM record before fetching the
+    // user's profile. This prevents a result-page race with the assignment rule.
+    await wait(OWNER_STABILITY_CHECK_MS);
+    const confirmedLead = await getLeadById(lead.id);
+    const confirmedOwnerId = String(confirmedLead?.Owner?.id || "").trim();
+
+    if (!confirmedOwnerId || confirmedOwnerId !== ownerId) {
+      return pending(res, "owner_assignment_in_progress", {
+        stage: "owner",
+        leadId: lead.id,
+        matchedBy: first.matchedBy,
+      });
+    }
+
+    lead = confirmedLead || lead;
+    ownerId = confirmedOwnerId;
+
+    // Source of truth: the CRM USER profile belonging to the Lead Owner.
+    const owner = await getUserById(ownerId);
+    if (!owner) {
+      return pending(res, "owner_profile_not_ready", {
+        stage: "owner_profile",
+        leadId: lead.id,
+        matchedBy: first.matchedBy,
+      });
+    }
+
+    const { bookingUrl, calendarField } = pickOwnerCalendar(owner, language);
+
+    if (!bookingUrl) {
+      return res.json({
+        status: "calendar_missing",
+        reason: "language_calendar_missing",
+        leadId: lead.id,
+        owner: {
+          id: ownerId,
+          name: String(owner.full_name || lead?.Owner?.name || "").trim() || null,
+        },
+        bookingUrl: null,
+        language,
+        calendarField,
+        matchedBy: first.matchedBy,
+      });
+    }
 
     return res.json({
+      status: "ready",
       leadId: lead.id,
       owner: {
         id: ownerId,
-        name: String(lead?.Owner?.name || "").trim() || null,
+        name: String(owner.full_name || lead?.Owner?.name || "").trim() || null,
       },
       bookingUrl,
       language,
       calendarField,
-      matchedBy,
+      matchedBy: first.matchedBy,
     });
   } catch (error) {
+    const status = Number(error?.status || 0);
+    const code = String(error?.code || "");
+
+    // The Users endpoint requires a refresh token authorized for CRM user read
+    // access. Return a machine-readable configuration error instead of silently
+    // falling back to a copied Lead field or the surgeon's calendar.
+    if (status === 401 || status === 403 || code === "OAUTH_SCOPE_MISMATCH") {
+      console.error(
+        "[GET /api/lead-owner-booking] Zoho Users API authorization error:",
+        status,
+        code
+      );
+      return res.status(503).json({
+        status: "configuration_error",
+        code: "ZOHO_USERS_SCOPE_REQUIRED",
+        error: "Zoho user-profile calendar lookup is not authorized",
+        bookingUrl: null,
+      });
+    }
+
     console.error("[GET /api/lead-owner-booking] error:", String(error?.message || error));
-    return res.status(500).json({ error: "owner booking lookup failed" });
+    return res.status(500).json({
+      status: "error",
+      error: "owner booking lookup failed",
+      bookingUrl: null,
+    });
   }
 });
 
