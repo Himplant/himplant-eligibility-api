@@ -2,9 +2,6 @@ import "dotenv/config";
 import express from "express";
 import fetch from "node-fetch";
 
-// Bootstrap the existing production server without rewriting server.js.
-// We temporarily intercept app.listen(), import the existing server, add the
-// lead-owner booking endpoint, then start the captured Express app normally.
 const originalListen = express.application.listen;
 let capturedApp = null;
 let capturedListenArgs = null;
@@ -27,17 +24,15 @@ const ZOHO_ACCOUNTS = "https://accounts.zoho.com";
 const ZOHO_API_BASE = "https://www.zohoapis.com";
 const { ZOHO_CLIENT_ID, ZOHO_CLIENT_SECRET, ZOHO_REFRESH_TOKEN } = process.env;
 
-// Calendar fields live on the Zoho CRM USER profile. The Lead is used only to
-// resolve the current Owner.id. No copied Lead calendar field is used as the
-// source of truth.
 const USER_CALENDAR_EN = "Calendar_Link";
 const USER_CALENDAR_ES = "Spanish_Calendar_Link";
 const USER_CALENDAR_AR = "Arabic_Calendar_Link";
 
-// The questionnaire normally gives Zoho plenty of time to create and assign the
-// Lead before this endpoint is called. These short safeguards only cover the
-// uncommon case where the final step races the assignment workflow.
-const ASSIGNMENT_GRACE_MS = 8_000;
+// The website begins resolving in the background as soon as the Lead is created.
+// Zoho assignment workflows can take 30-50+ seconds. While Owner is still the
+// record creator, treat it as temporary for up to 60 seconds so we never cache
+// the creator's missing language calendar before the real sales owner is assigned.
+const ASSIGNMENT_GRACE_MS = 60_000;
 const OWNER_STABILITY_CHECK_MS = 500;
 const RETRY_AFTER_MS = 750;
 
@@ -52,15 +47,8 @@ function normalizeEmail(value) {
 
 function normalizeLanguage(value) {
   const lang = String(value || "en").trim().toLowerCase();
-
-  if (["es", "es-es", "spanish", "espanol", "español"].includes(lang)) {
-    return "es";
-  }
-
-  if (["ar", "ar-sa", "arabic", "العربية"].includes(lang)) {
-    return "ar";
-  }
-
+  if (["es", "es-es", "spanish", "espanol", "español"].includes(lang)) return "es";
+  if (["ar", "ar-sa", "arabic", "العربية"].includes(lang)) return "ar";
   return "en";
 }
 
@@ -87,9 +75,7 @@ function recordAgeMs(lead) {
 
 async function getOwnerLookupAccessToken() {
   const now = Date.now();
-  if (ownerLookupAccessToken && now < ownerLookupTokenExpiresAt - 60_000) {
-    return ownerLookupAccessToken;
-  }
+  if (ownerLookupAccessToken && now < ownerLookupTokenExpiresAt - 60_000) return ownerLookupAccessToken;
 
   if (!ZOHO_CLIENT_ID || !ZOHO_CLIENT_SECRET || !ZOHO_REFRESH_TOKEN) {
     const error = new Error("Missing Zoho env vars");
@@ -104,9 +90,7 @@ async function getOwnerLookupAccessToken() {
     grant_type: "refresh_token",
   });
 
-  const response = await fetch(`${ZOHO_ACCOUNTS}/oauth/v2/token?${params.toString()}`, {
-    method: "POST",
-  });
+  const response = await fetch(`${ZOHO_ACCOUNTS}/oauth/v2/token?${params.toString()}`, { method: "POST" });
   const data = await response.json().catch(() => ({}));
 
   if (!response.ok || !data.access_token) {
@@ -141,18 +125,14 @@ async function ownerLookupZohoGet(path) {
 
 async function findLeadBySessionId(sessionId) {
   const criteria = `(Session_ID:equals:${sessionId})`;
-  const data = await ownerLookupZohoGet(
-    `/crm/v2/Leads/search?criteria=${encodeURIComponent(criteria)}`
-  );
+  const data = await ownerLookupZohoGet(`/crm/v2/Leads/search?criteria=${encodeURIComponent(criteria)}`);
   return data?.data?.[0] || null;
 }
 
 async function findLeadByEmail(email) {
   if (!email) return null;
   const criteria = `(Email:equals:${email})`;
-  const data = await ownerLookupZohoGet(
-    `/crm/v2/Leads/search?criteria=${encodeURIComponent(criteria)}`
-  );
+  const data = await ownerLookupZohoGet(`/crm/v2/Leads/search?criteria=${encodeURIComponent(criteria)}`);
   return data?.data?.[0] || null;
 }
 
@@ -167,8 +147,6 @@ async function getUserById(userId) {
 }
 
 async function resolveLead(sessionId, email) {
-  // Session_ID is authoritative. Email is a fallback only for temporary Zoho
-  // search-index lag or an older intake that did not persist Session_ID cleanly.
   let lead = await findLeadBySessionId(sessionId);
   let matchedBy = "session";
 
@@ -179,8 +157,6 @@ async function resolveLead(sessionId, email) {
 
   if (!lead?.id) return { lead: null, matchedBy: null };
 
-  // Re-read by Zoho record ID so Owner reflects the current CRM record rather
-  // than a potentially stale search-index snapshot.
   const freshLead = await getLeadById(lead.id);
   return { lead: freshLead || lead, matchedBy };
 }
@@ -201,48 +177,31 @@ capturedApp.get("/api/lead-owner-booking", async (req, res) => {
   const email = normalizeEmail(suppliedEmail);
   const language = normalizeLanguage(req.query.lang);
 
-  if (!sessionId) {
-    return res.status(400).json({ status: "error", error: "session_id is required" });
-  }
-
-  if (suppliedEmail && !email) {
-    return res.status(400).json({ status: "error", error: "email is invalid" });
-  }
+  if (!sessionId) return res.status(400).json({ status: "error", error: "session_id is required" });
+  if (suppliedEmail && !email) return res.status(400).json({ status: "error", error: "email is invalid" });
 
   try {
     const first = await resolveLead(sessionId, email);
     let lead = first.lead;
 
-    // Never expose a booking calendar until the questionnaire can be tied back
-    // to a real Zoho CRM Lead.
-    if (!lead?.id) {
-      return pending(res, "crm_record_not_ready", { stage: "lead" });
-    }
+    if (!lead?.id) return pending(res, "crm_record_not_ready", { stage: "lead" });
 
     let ownerId = String(lead?.Owner?.id || "").trim();
     if (!ownerId) {
-      return pending(res, "owner_not_ready", {
-        stage: "owner",
-        leadId: lead.id,
-        matchedBy: first.matchedBy,
-      });
+      return pending(res, "owner_not_ready", { stage: "owner", leadId: lead.id, matchedBy: first.matchedBy });
     }
 
-    // Zoho creates the record under the API/creator user before assignment rules
-    // can replace Owner. For a newly created record, do not accept that temporary
-    // owner immediately; allow the assignment workflow a brief window to finish.
     const createdById = String(lead?.Created_By?.id || "").trim();
     const ageMs = recordAgeMs(lead);
-    if (createdById && ownerId === createdById && ageMs !== null && ageMs < ASSIGNMENT_GRACE_MS) {
+    if (createdById && ownerId === createdById && (ageMs === null || ageMs < ASSIGNMENT_GRACE_MS)) {
       return pending(res, "owner_assignment_in_progress", {
         stage: "owner",
         leadId: lead.id,
+        ownerId,
         matchedBy: first.matchedBy,
       });
     }
 
-    // Confirm the Owner is stable on the actual CRM record before fetching the
-    // user's profile. This prevents a race with the assignment rule.
     await wait(OWNER_STABILITY_CHECK_MS);
     const confirmedLead = await getLeadById(lead.id);
     const confirmedOwnerId = String(confirmedLead?.Owner?.id || "").trim();
@@ -255,10 +214,26 @@ capturedApp.get("/api/lead-owner-booking", async (req, res) => {
       });
     }
 
+    // Repeat the creator-owner guard after the stability read so a creator-owned
+    // snapshot can never become terminal during the assignment grace period.
+    const confirmedCreatedById = String(confirmedLead?.Created_By?.id || createdById || "").trim();
+    const confirmedAgeMs = recordAgeMs(confirmedLead || lead);
+    if (
+      confirmedCreatedById &&
+      confirmedOwnerId === confirmedCreatedById &&
+      (confirmedAgeMs === null || confirmedAgeMs < ASSIGNMENT_GRACE_MS)
+    ) {
+      return pending(res, "owner_assignment_in_progress", {
+        stage: "owner",
+        leadId: lead.id,
+        ownerId: confirmedOwnerId,
+        matchedBy: first.matchedBy,
+      });
+    }
+
     lead = confirmedLead || lead;
     ownerId = confirmedOwnerId;
 
-    // Source of truth: the CRM USER profile belonging to the current Lead Owner.
     const owner = await getUserById(ownerId);
     if (!owner) {
       return pending(res, "owner_profile_not_ready", {
@@ -276,10 +251,7 @@ capturedApp.get("/api/lead-owner-booking", async (req, res) => {
         reason: "language_calendar_missing",
         source: "zoho_user_profile",
         leadId: lead.id,
-        owner: {
-          id: ownerId,
-          name: String(owner.full_name || lead?.Owner?.name || "").trim() || null,
-        },
+        owner: { id: ownerId, name: String(owner.full_name || lead?.Owner?.name || "").trim() || null },
         bookingUrl: null,
         language,
         calendarField,
@@ -291,10 +263,7 @@ capturedApp.get("/api/lead-owner-booking", async (req, res) => {
       status: "ready",
       source: "zoho_user_profile",
       leadId: lead.id,
-      owner: {
-        id: ownerId,
-        name: String(owner.full_name || lead?.Owner?.name || "").trim() || null,
-      },
+      owner: { id: ownerId, name: String(owner.full_name || lead?.Owner?.name || "").trim() || null },
       bookingUrl,
       language,
       calendarField,
@@ -304,15 +273,8 @@ capturedApp.get("/api/lead-owner-booking", async (req, res) => {
     const status = Number(error?.status || 0);
     const code = String(error?.code || "");
 
-    // The Users endpoint requires a refresh token authorized for CRM user read
-    // access. Return a machine-readable configuration error instead of silently
-    // falling back to a copied Lead field or the surgeon's calendar.
     if (status === 401 || status === 403 || code === "OAUTH_SCOPE_MISMATCH") {
-      console.error(
-        "[GET /api/lead-owner-booking] Zoho Users API authorization error:",
-        status,
-        code
-      );
+      console.error("[GET /api/lead-owner-booking] Zoho Users API authorization error:", status, code);
       return res.status(503).json({
         status: "configuration_error",
         code: "ZOHO_USERS_SCOPE_REQUIRED",
@@ -322,11 +284,7 @@ capturedApp.get("/api/lead-owner-booking", async (req, res) => {
     }
 
     console.error("[GET /api/lead-owner-booking] error:", String(error?.message || error));
-    return res.status(500).json({
-      status: "error",
-      error: "owner booking lookup failed",
-      bookingUrl: null,
-    });
+    return res.status(500).json({ status: "error", error: "owner booking lookup failed", bookingUrl: null });
   }
 });
 
