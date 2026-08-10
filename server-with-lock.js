@@ -7,5 +7,5 @@ import "dotenv/config";
 //
 // Do not reintroduce a submission lock here unless it is strictly fail-open:
 // lock/RPC failure must log and forward to the normal Zoho submission handler.
-console.warn("server-with-lock.js is disabled; starting direct server.js path.");
-await import("./server.js");
+console.warn("server-with-lock.js is disabled; starting server-bootstrap.js path.");
+await import("./server-bootstrap.js");
