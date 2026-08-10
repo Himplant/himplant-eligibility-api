@@ -34,8 +34,12 @@ const USER_CALENDAR_EN = "Calendar_Link";
 const USER_CALENDAR_ES = "Spanish_Calendar_Link";
 const USER_CALENDAR_AR = "Arabic_Calendar_Link";
 
-const ASSIGNMENT_GRACE_MS = 30_000;
-const OWNER_STABILITY_CHECK_MS = 1_250;
+// The questionnaire normally gives Zoho plenty of time to create and assign the
+// Lead before this endpoint is called. These short safeguards only cover the
+// uncommon case where the final step races the assignment workflow.
+const ASSIGNMENT_GRACE_MS = 8_000;
+const OWNER_STABILITY_CHECK_MS = 500;
+const RETRY_AFTER_MS = 750;
 
 let ownerLookupAccessToken = null;
 let ownerLookupTokenExpiresAt = 0;
@@ -48,7 +52,16 @@ function normalizeEmail(value) {
 
 function normalizeLanguage(value) {
   const lang = String(value || "en").trim().toLowerCase();
-  return lang === "es" || lang === "ar" ? lang : "en";
+
+  if (["es", "es-es", "spanish", "espanol", "español"].includes(lang)) {
+    return "es";
+  }
+
+  if (["ar", "ar-sa", "arabic", "العربية"].includes(lang)) {
+    return "ar";
+  }
+
+  return "en";
 }
 
 function requestedCalendarField(language) {
@@ -176,7 +189,7 @@ function pending(res, reason, extra = {}) {
   return res.json({
     status: "pending",
     reason,
-    retryAfterMs: 1500,
+    retryAfterMs: RETRY_AFTER_MS,
     bookingUrl: null,
     ...extra,
   });
@@ -217,7 +230,7 @@ capturedApp.get("/api/lead-owner-booking", async (req, res) => {
 
     // Zoho creates the record under the API/creator user before assignment rules
     // can replace Owner. For a newly created record, do not accept that temporary
-    // owner immediately; allow the assignment workflow time to finish.
+    // owner immediately; allow the assignment workflow a brief window to finish.
     const createdById = String(lead?.Created_By?.id || "").trim();
     const ageMs = recordAgeMs(lead);
     if (createdById && ownerId === createdById && ageMs !== null && ageMs < ASSIGNMENT_GRACE_MS) {
@@ -229,7 +242,7 @@ capturedApp.get("/api/lead-owner-booking", async (req, res) => {
     }
 
     // Confirm the Owner is stable on the actual CRM record before fetching the
-    // user's profile. This prevents a result-page race with the assignment rule.
+    // user's profile. This prevents a race with the assignment rule.
     await wait(OWNER_STABILITY_CHECK_MS);
     const confirmedLead = await getLeadById(lead.id);
     const confirmedOwnerId = String(confirmedLead?.Owner?.id || "").trim();
@@ -245,7 +258,7 @@ capturedApp.get("/api/lead-owner-booking", async (req, res) => {
     lead = confirmedLead || lead;
     ownerId = confirmedOwnerId;
 
-    // Source of truth: the CRM USER profile belonging to the Lead Owner.
+    // Source of truth: the CRM USER profile belonging to the current Lead Owner.
     const owner = await getUserById(ownerId);
     if (!owner) {
       return pending(res, "owner_profile_not_ready", {
@@ -261,6 +274,7 @@ capturedApp.get("/api/lead-owner-booking", async (req, res) => {
       return res.json({
         status: "calendar_missing",
         reason: "language_calendar_missing",
+        source: "zoho_user_profile",
         leadId: lead.id,
         owner: {
           id: ownerId,
@@ -275,6 +289,7 @@ capturedApp.get("/api/lead-owner-booking", async (req, res) => {
 
     return res.json({
       status: "ready",
+      source: "zoho_user_profile",
       leadId: lead.id,
       owner: {
         id: ownerId,
