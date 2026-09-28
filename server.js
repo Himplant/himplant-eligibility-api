@@ -454,10 +454,21 @@ async function createZohoErrorTask({ leadId, submissionType, sessionId, email, p
   }
 }
 
-async function notifySupabaseEligibilityComplete(email) {
-  if (!SUPABASE_ELIGIBILITY_API_KEY) return { success: false, reason: "not_configured" };
-  if (!SUPABASE_ANON_KEY) return { success: false, reason: "anon_key_not_configured" };
-  if (!email) return { success: false, reason: "no_email" };
+// Tells the app (Supabase eligibility-complete) that a questionnaire is complete.
+// SCRUM-24: sends the app's journey id when the questionnaire was opened from the
+// app, so the completion is tied to that user even if they typed another email.
+// eligibility-complete is safe to repeat, so failed calls (network errors, 5xx,
+// 429) are retried in the background. The retries live in this process; a
+// restart drops any still waiting.
+const ELIGIBILITY_RETRY_DELAYS_MS = [30e3, 2 * 60e3, 10 * 60e3, 30 * 60e3, 2 * 60 * 60e3];
+const APP_JOURNEY_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function appJourneyIdFrom(value) {
+  const id = String(value || "").trim();
+  return APP_JOURNEY_ID.test(id) ? id.toLowerCase() : null;
+}
+
+async function callEligibilityComplete(payload) {
   try {
     const response = await fetch(ELIGIBILITY_WEBHOOK_URL, {
       method: "POST",
@@ -465,14 +476,42 @@ async function notifySupabaseEligibilityComplete(email) {
         "Content-Type": "application/json",
         Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
       },
-      body: JSON.stringify({ email, api_key: SUPABASE_ELIGIBILITY_API_KEY }),
+      body: JSON.stringify({ ...payload, api_key: SUPABASE_ELIGIBILITY_API_KEY }),
     });
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok) return { success: false, reason: "request_failed", status: response.status, data };
-    return { success: true, data };
-  } catch (err) {
-    return { success: false, reason: "exception", error: err.message };
+    const retry = response.status >= 500 || response.status === 429;
+    return { success: response.ok, status: response.status, retry };
+  } catch {
+    return { success: false, status: 0, retry: true };
   }
+}
+
+function retryEligibilityComplete(payload, attempt = 0) {
+  if (attempt >= ELIGIBILITY_RETRY_DELAYS_MS.length) {
+    console.error("[eligibility-complete] gave up after retries");
+    return;
+  }
+  const timer = setTimeout(async () => {
+    const result = await callEligibilityComplete(payload);
+    if (result.retry) retryEligibilityComplete(payload, attempt + 1);
+    else if (!result.success) console.error(`[eligibility-complete] retry rejected: ${result.status}`);
+  }, ELIGIBILITY_RETRY_DELAYS_MS[attempt]);
+  timer.unref?.();
+}
+
+async function notifySupabaseEligibilityComplete(email, journeyId = null) {
+  if (!SUPABASE_ELIGIBILITY_API_KEY) return { success: false, reason: "not_configured" };
+  if (!SUPABASE_ANON_KEY) return { success: false, reason: "anon_key_not_configured" };
+  if (!email && !journeyId) return { success: false, reason: "no_identifier" };
+  const payload = { email: email || undefined, journey_id: journeyId || undefined };
+  const result = await callEligibilityComplete(payload);
+  if (result.success) return { success: true };
+  if (result.retry) {
+    console.warn(`[eligibility-complete] failed (${result.status}), retrying in background`);
+    retryEligibilityComplete(payload);
+    return { success: false, reason: "retrying" };
+  }
+  console.error(`[eligibility-complete] rejected: ${result.status}`);
+  return { success: false, reason: "rejected", status: result.status };
 }
 
 app.get("/health", (req, res) => res.json({ ok: true }));
@@ -1016,7 +1055,7 @@ app.post("/api/submissions", async (req, res) => {
           let supabaseWebhookResult = null;
           const webhookEmail = email || normalizeEmail(lead?.Email);
           if (type === "complete") {
-            supabaseWebhookResult = await notifySupabaseEligibilityComplete(webhookEmail);
+            supabaseWebhookResult = await notifySupabaseEligibilityComplete(webhookEmail, appJourneyIdFrom(submission.app_journey_id));
           }
 
           return {
