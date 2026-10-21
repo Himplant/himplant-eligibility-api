@@ -1116,6 +1116,84 @@ app.post("/api/submissions", async (req, res) => {
   }
 });
 
+/* -----------------------------
+   Secure app prefill handoff (SCRUM-23)
+------------------------------ */
+// The Himplant app hands the questionnaire a one-time code instead of putting a
+// person's name, email and phone in the URL. The page sends the code here; this
+// server redeems it with the app's Supabase using the shared server secret, which
+// never reaches the browser. Codes are single-use, expire in five minutes and are
+// never logged.
+const ELIGIBILITY_HANDOFF_URL =
+  process.env.ELIGIBILITY_HANDOFF_URL ||
+  ELIGIBILITY_WEBHOOK_URL.replace(/\/eligibility-complete\/?$/, "/eligibility-handoff");
+const HANDOFF_CODE_PATTERN = /^[A-Za-z0-9_-]{43}$/;
+const HANDOFF_RATE_LIMIT = 20;
+const HANDOFF_RATE_WINDOW_MS = 10 * 60 * 1000;
+const handoffAttempts = new Map();
+
+function handoffClientKey(req) {
+  const forwarded = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim();
+  return forwarded || req.socket?.remoteAddress || "unknown";
+}
+
+function handoffRateLimited(req) {
+  const now = Date.now();
+  const key = handoffClientKey(req);
+  const recent = (handoffAttempts.get(key) || []).filter((t) => now - t < HANDOFF_RATE_WINDOW_MS);
+  recent.push(now);
+  handoffAttempts.set(key, recent);
+  if (handoffAttempts.size > 10000) {
+    for (const [k, times] of handoffAttempts) {
+      if (!times.some((t) => now - t < HANDOFF_RATE_WINDOW_MS)) handoffAttempts.delete(k);
+    }
+  }
+  return recent.length > HANDOFF_RATE_LIMIT;
+}
+
+app.post("/api/handoff/exchange", async (req, res) => {
+  res.set("Cache-Control", "no-store");
+  if (handoffRateLimited(req)) return res.status(429).json({ error: "rate_limited" });
+
+  const code = typeof req.body?.code === "string" ? req.body.code : "";
+  if (!HANDOFF_CODE_PATTERN.test(code)) return res.status(400).json({ error: "invalid_code" });
+  if (!SUPABASE_ELIGIBILITY_API_KEY || !SUPABASE_ANON_KEY) {
+    console.error("[handoff] exchange is not configured");
+    return res.status(503).json({ error: "unavailable" });
+  }
+
+  try {
+    const response = await fetch(ELIGIBILITY_HANDOFF_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+        "x-eligibility-api-key": SUPABASE_ELIGIBILITY_API_KEY,
+      },
+      body: JSON.stringify({ action: "exchange", code }),
+    });
+    if (response.status === 404) return res.status(404).json({ error: "invalid_or_expired" });
+    if (!response.ok) {
+      console.error(`[handoff] exchange failed with status ${response.status}`);
+      return res.status(502).json({ error: "unavailable" });
+    }
+    const data = await response.json();
+    const prefill = data?.prefill && typeof data.prefill === "object" ? data.prefill : {};
+    const pick = (value) => (typeof value === "string" && value.trim() ? value.trim().slice(0, 200) : undefined);
+    return res.json({
+      prefill: {
+        first_name: pick(prefill.first_name),
+        last_name: pick(prefill.last_name),
+        email: pick(prefill.email),
+        phone: pick(prefill.phone),
+      },
+    });
+  } catch {
+    console.error("[handoff] exchange request failed");
+    return res.status(502).json({ error: "unavailable" });
+  }
+});
+
 const port = process.env.PORT || 10000;
 app.listen(port, () => console.log(`API running on port ${port}`));
 
