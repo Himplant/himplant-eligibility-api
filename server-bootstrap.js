@@ -30,6 +30,9 @@ const USER_FIELDS = {
   en: "Calendar_Link",
   es: "Spanish_Calendar_Link",
   ar: "Arabic_Calendar_Link",
+  // No Portuguese calendar is configured in Zoho yet. Preserve the current
+  // English booking fallback while keeping the requested locale as Portuguese.
+  pt: "Calendar_Link",
 };
 
 // These fields are populated on the Lead by the existing Zoho calendarupdate
@@ -39,6 +42,7 @@ const LEAD_FIELDS = {
   en: "Lead_Owner_Calendar_Link",
   es: "Spanish_Calendar_Link",
   ar: "Arabic_Calendar_Link",
+  pt: "Lead_Owner_Calendar_Link",
 };
 
 let accessToken = null;
@@ -54,6 +58,7 @@ function normalizeLanguage(value) {
   const lang = String(value || "en").trim().toLowerCase();
   if (["es", "es-es", "spanish", "espanol", "español"].includes(lang)) return "es";
   if (["ar", "ar-sa", "arabic", "العربية"].includes(lang)) return "ar";
+  if (["pt", "pt-br", "pt_br", "portuguese", "português", "portugues", "português (brasil)"].includes(lang)) return "pt";
   return "en";
 }
 
@@ -173,6 +178,7 @@ function ready(res, { lead, ownerId, language, bookingUrl, calendarField, matche
     },
     bookingUrl,
     language,
+    calendarLanguage: language === "pt" ? "en" : language,
     calendarField,
     matchedBy,
   });
@@ -299,3 +305,4 @@ capturedApp.get("/api/lead-owner-booking", async (req, res) => {
 });
 
 originalListen.apply(capturedApp, capturedListenArgs);
+

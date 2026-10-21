@@ -147,6 +147,7 @@ function normalizePreferredLanguageForZoho(v) {
   if (lower === "english" || lower === "en") return "English";
   if (lower === "spanish" || lower === "es") return "Spanish";
   if (lower === "arabic" || lower === "ar") return "Arabic";
+  if (["pt", "pt-br", "pt_br", "portuguese", "português", "portugues", "português (brasil)"].includes(lower)) return "Portuguese";
   return null;
 }
 
@@ -1117,3 +1118,4 @@ app.post("/api/submissions", async (req, res) => {
 
 const port = process.env.PORT || 10000;
 app.listen(port, () => console.log(`API running on port ${port}`));
+

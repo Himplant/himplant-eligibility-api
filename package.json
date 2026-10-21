@@ -4,7 +4,8 @@
   "type": "module",
   "main": "server-bootstrap.js",
   "scripts": {
-    "start": "node server-bootstrap.js"
+    "start": "node server-bootstrap.js",
+    "test": "node --test test/*.test.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
@@ -13,3 +14,4 @@
     "node-fetch": "^3.3.2"
   }
 }
+
